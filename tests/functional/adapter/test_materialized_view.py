@@ -42,6 +42,50 @@ MY_MV_ASYNC_SQL = """
 select id, value from {{ ref('my_seed') }}
 """.lstrip()
 
+# Structural-config changes (distribution / buckets). These can't be altered in
+# place, so they must force a rebuild.
+
+MY_MV_DIST_CHANGED = """
+{{ config(
+    materialized='materialized_view',
+    distributed_by=['value'],
+    refresh_method='manual'
+) }}
+select id, value from {{ ref('my_seed') }}
+""".lstrip()
+
+MY_MV_BUCKETS_CHANGED = """
+{{ config(
+    materialized='materialized_view',
+    distributed_by=['id'],
+    buckets=3,
+    refresh_method='manual'
+) }}
+select id, value from {{ ref('my_seed') }}
+""".lstrip()
+
+MY_MV_ORDER_BY = """
+{{ config(
+    materialized='materialized_view',
+    distributed_by=['id'],
+    refresh_method='manual',
+    order_by=['id']
+) }}
+select id, value from {{ ref('my_seed') }}
+""".lstrip()
+
+# A user-set property. Only keys the model specifies are compared; StarRocks'
+# injected defaults (replication_num, storage_medium, ...) must be ignored.
+MY_MV_WITH_PROPERTY = """
+{{ config(
+    materialized='materialized_view',
+    distributed_by=['id'],
+    refresh_method='manual',
+    properties={"session.insert_timeout": "3600"}
+) }}
+select id, value from {{ ref('my_seed') }}
+""".lstrip()
+
 # Models for reactivation tests
 
 MY_BASE_VIEW_SQL = """
@@ -109,6 +153,18 @@ def _refresh_type(project, mv_name: str) -> str:
     )
     assert result is not None, f"MV '{mv_name}' not found in information_schema"
     return result[0].upper()
+
+
+def _mv_definition(project, mv_name: str) -> str:
+    """Return the stored MATERIALIZED_VIEW_DEFINITION (lower-cased) for the MV."""
+    schema = project.test_schema
+    result = project.run_sql(
+        f"select materialized_view_definition from information_schema.materialized_views"
+        f" where table_schema = '{schema}' and table_name = '{mv_name}'",
+        fetch="one",
+    )
+    assert result is not None, f"MV '{mv_name}' not found in information_schema"
+    return result[0].lower()
 
 
 def _server_version(project) -> tuple:
@@ -222,6 +278,89 @@ class TestMaterializedViewConfigChangeDetection:
         assert _refresh_type(project, "my_mv") == "ASYNC"
         # MV must stay active — an in-place ALTER does not deactivate it.
         assert _is_active(project, "my_mv") == "true"
+
+    def test_distribution_change_triggers_rebuild(self, project, my_mv):
+        """
+        Changing distributed_by can't be altered in place, so it must trigger a
+        rebuild ('Applying ALTER to:') and the new distribution must be applied.
+        """
+        _skip_if_before(project, (4, 0, 2),
+                        "structural change detection requires verbatim MV storage (>= 4.0.2)")
+
+        set_model_file(project, my_mv, MY_MV_DIST_CHANGED)
+
+        _, logs = run_dbt_and_capture(["--debug", "run"])
+
+        assert f"Applying ALTER to: {my_mv}" in logs, (
+            "Expected MV to be rebuilt after distributed_by change"
+        )
+        assert "hash(`value`)" in _mv_definition(project, "my_mv"), (
+            "rebuilt MV should use the new distribution key"
+        )
+
+    def test_buckets_change_triggers_rebuild(self, project, my_mv):
+        """
+        Adding/changing buckets can't be altered in place, so it must trigger a
+        rebuild and the new bucket count must be applied.
+        """
+        _skip_if_before(project, (4, 0, 2),
+                        "structural change detection requires verbatim MV storage (>= 4.0.2)")
+
+        set_model_file(project, my_mv, MY_MV_BUCKETS_CHANGED)
+
+        _, logs = run_dbt_and_capture(["--debug", "run"])
+
+        assert f"Applying ALTER to: {my_mv}" in logs, (
+            "Expected MV to be rebuilt after buckets change"
+        )
+        assert "buckets 3" in _mv_definition(project, "my_mv"), (
+            "rebuilt MV should use the new bucket count"
+        )
+
+    def test_order_by_change_triggers_rebuild(self, project, my_mv):
+        """
+        ORDER BY can't be altered in place, so adding/changing it must trigger a
+        rebuild and the new sort key must be applied.
+        """
+        _skip_if_before(project, (4, 0, 2),
+                        "structural change detection requires verbatim MV storage (>= 4.0.2)")
+
+        set_model_file(project, my_mv, MY_MV_ORDER_BY)
+
+        _, logs = run_dbt_and_capture(["--debug", "run"])
+
+        assert f"Applying ALTER to: {my_mv}" in logs, (
+            "Expected MV to be rebuilt after order_by was set"
+        )
+        assert "order by (id)" in _mv_definition(project, "my_mv"), (
+            "rebuilt MV should carry the new ORDER BY"
+        )
+
+    def test_property_change_triggers_rebuild(self, project, my_mv):
+        """
+        Setting/changing a user property triggers a rebuild and is applied. A
+        subsequent unchanged run must NOT rebuild — StarRocks injects default
+        properties on every MV, and only the user-set keys should be compared.
+        """
+        _skip_if_before(project, (4, 0, 2),
+                        "property change detection requires verbatim MV storage (>= 4.0.2)")
+
+        set_model_file(project, my_mv, MY_MV_WITH_PROPERTY)
+
+        _, logs = run_dbt_and_capture(["--debug", "run"])
+        assert f"Applying ALTER to: {my_mv}" in logs, (
+            "Expected MV to be rebuilt after a property was set"
+        )
+        assert 'insert_timeout" = "3600"' in _mv_definition(project, "my_mv"), (
+            "rebuilt MV should carry the user-set property"
+        )
+
+        # Re-run with no change: the user property still matches, and the
+        # StarRocks-injected defaults must not be mistaken for a change.
+        _, logs2 = run_dbt_and_capture(["--debug", "run"])
+        assert f"Applying ALTER to: {my_mv}" not in logs2, (
+            "unchanged property run must not rebuild (injected defaults ignored)"
+        )
 
 
 class TestMaterializedViewSelfReactivation:
