@@ -1,7 +1,9 @@
 {% macro starrocks__get_replace_materialized_view_as_sql(relation, sql, existing_relation, backup_relation, intermediate_relation) %}
-    {{ starrocks__get_drop_relation_sql(existing_relation) }}
-    {{ starrocks__get_create_materialized_view_as_sql(relation, sql) }}
-{% endmacro %}
+    {%- call statement('create_intermediate', fetch_result=False) -%}
+        {{ starrocks__get_create_materialized_view_as_sql(intermediate_relation, sql) }}
+    {%- endcall -%}
+    alter materialized view `{{ intermediate_relation.identifier }}` swap with `{{ existing_relation.identifier }}`
+{%- endmacro %}
 
 {% macro starrocks__drop_materialized_view(relation) -%}
     drop materialized view if exists {{ relation }};
@@ -62,7 +64,84 @@
     {% endcall %}
 {% endmacro %}
 
+{% macro starrocks__refresh_materialized_view(relation) %}
+  {%- if config.get('force_refresh', false) -%}
+    refresh materialized view {{ relation }} with sync mode
+  {%- else -%}
+    {{ return("") }}
+  {%- endif -%}
+{% endmacro %}
+
+{% macro starrocks__normalize_mv_sql(s) -%}
+  {# Strip SQL comments and blank lines #}
+  {%- set ns = namespace(lines=[]) -%}
+  {%- for raw in s.split('\n') -%}
+    {%- set line = raw.strip() -%}
+    {%- if line.startswith('--') -%}
+    {%- elif '--' in line -%}
+      {%- set trimmed = line[:line.find('--')].strip() -%}
+      {%- if trimmed -%}{%- do ns.lines.append(trimmed) -%}{%- endif -%}
+    {%- elif line -%}
+      {%- do ns.lines.append(line) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- ns.lines | join('\n') -}}
+{%- endmacro %}
+
 {% macro starrocks__get_materialized_view_configuration_changes(existing_relation, new_config) %}
+  {#
+    Returns none when no changes are detected (dbt takes the no-op refresh path).
+    Returns a non-empty dict when changes are detected describing changes. 
+  #}
+  {%- set mv_query -%}
+    select is_active                  as is_active,
+           materialized_view_definition as mv_def,
+           refresh_type               as refresh_type
+    from information_schema.materialized_views
+    where table_schema = '{{ existing_relation.schema }}'
+      and table_name   = '{{ existing_relation.table }}'
+  {%- endset -%}
+  {%- set mv_info = run_query(mv_query) -%}
+
+  {%- if mv_info.rows | length == 0 -%}
+    {{ return(none) }}
+  {%- endif -%}
+
+  {%- set is_active        = mv_info[0]['is_active'] -%}
+  {%- set existing_def     = mv_info[0]['mv_def'] | trim -%}
+  {%- set existing_refresh = mv_info[0]['refresh_type'] | lower -%}
+
+  {%- if is_active == 'false' -%}
+    {%- call statement('reactivate_' ~ existing_relation.identifier, fetch_result=False) -%}
+      alter materialized view {{ existing_relation }} active
+    {%- endcall -%}
+  {%- endif -%}
+
+  {%- set changes = {} -%}
+
+  {%- set new_refresh = config.get('refresh_method', 'manual') | lower -%}
+  {%- if existing_refresh != new_refresh -%}
+    {%- do changes.update({'refresh_method': new_refresh}) -%}
+  {%- endif -%}
+
+  {%- set def_lower = existing_def.lower() -%}
+  {%- set as_pos = def_lower.find('\nas ') if def_lower.find('\nas ') >= 0 else def_lower.find('\nas\n') -%}
+  {%- if as_pos >= 0 -%}
+    {%- set stored_raw = existing_def[as_pos + 4:] | trim -%}
+    {%- set stored_sql = stored_raw[:-1] | trim if stored_raw.endswith(';') else stored_raw -%}
+    {%- set new_raw    = sql | trim -%}
+    {%- set new_sql    = new_raw[:-1] | trim if new_raw.endswith(';') else new_raw -%}
+    {%- if starrocks__normalize_mv_sql(stored_sql) != starrocks__normalize_mv_sql(new_sql) -%}
+      {%- do changes.update({'sql': true}) -%}
+    {%- endif -%}
+  {%- endif -%}
+
+  {%- if changes | length > 0 -%}
+    {{ return(changes) }}
+  {%- endif -%}
+
+  {{ return(none) }}
+
 {% endmacro %}
 
 {% macro starrocks__get_alter_materialized_view_as_sql(
@@ -73,7 +152,10 @@
     backup_relation,
     intermediate_relation
 ) %}
-
-    {{ starrocks__get_replace_materialized_view_as_sql(relation, sql, existing_relation, backup_relation, intermediate_relation) }}
-
+    {%- if configuration_changes.get('sql') -%}
+        {{ starrocks__get_replace_materialized_view_as_sql(relation, sql, existing_relation, backup_relation, intermediate_relation) }}
+    {%- else -%}
+        {# Only refresh_method changed: ALTER in-place #}
+        alter materialized view {{ relation }} refresh {{ configuration_changes['refresh_method'] }}
+    {%- endif -%}
 {% endmacro %}

@@ -93,15 +93,16 @@ class StarRocksCredentials(Credentials):
 
 def _parse_version(result):
     default_version = (999, 999, 999)
-    first_part = None
+    first_part = result
 
     if '-' in result:
         first_part = result.split('-')[0]
     if ' ' in result:
         first_part = result.split(' ')[0]
 
-    if first_part and len(first_part.split('.')) == 3:
-        return int(first_part[0]), int(first_part[2]), int(first_part[4])
+    parts = first_part.split('.')
+    if len(parts) == 3 and all(part.isdigit() for part in parts):
+        return int(parts[0]), int(parts[1]), int(parts[2])
 
     return default_version
 
