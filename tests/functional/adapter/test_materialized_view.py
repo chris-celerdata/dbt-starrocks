@@ -1,12 +1,3 @@
-"""
-Functional tests for the materialized view materialization.
-
-Tests are designed to run against a live StarRocks cluster (localhost:9030).
-
-Covers:
-- Option D: config change detection prevents unnecessary drop+recreate (SSU-1881 fix)
-- Option F: self-reactivation when IS_ACTIVE='false' caused by upstream view DDL
-"""
 import pytest
 
 from dbt.tests.util import (
@@ -17,21 +8,12 @@ from dbt.tests.util import (
 )
 from dbt.adapters.contracts.relation import RelationType
 
-
-# ---------------------------------------------------------------------------
-# Seed
-# ---------------------------------------------------------------------------
-
 MY_SEED = """
 id,value
 1,100
 2,200
 3,300
 """.strip()
-
-# ---------------------------------------------------------------------------
-# Model SQL
-# ---------------------------------------------------------------------------
 
 MY_MV_SQL = """
 {{ config(
@@ -60,10 +42,7 @@ MY_MV_ASYNC_SQL = """
 select id, value from {{ ref('my_seed') }}
 """.lstrip()
 
-# Models for the Option F (self-reactivation) test.
-# my_mv_on_view depends on my_base_view, which is a regular view.
-# When dbt recreates the view in the same run, StarRocks deactivates the MV;
-# Option F reactivates it before returning from get_materialized_view_configuration_changes.
+# Models for reactivation tests
 
 MY_BASE_VIEW_SQL = """
 {{ config(materialized='view') }}
@@ -77,6 +56,30 @@ MY_MV_ON_VIEW_SQL = """
     refresh_method='manual'
 ) }}
 select id, value from {{ ref('my_base_view') }}
+""".lstrip()
+
+# Models for skip DDL when view unchanged
+
+MY_VIEW_SQL = """
+{{ config(materialized='view') }}
+select id, value from {{ ref('my_seed') }}
+""".lstrip()
+
+# A genuine SQL change that does NOT alter column types, so the dependent
+# passthrough MV stays schema-compatible and can be reactivated. (Changing a
+# column's type, e.g. value * 10, would make StarRocks reject reactivation.)
+MY_VIEW_SQL_CHANGED = """
+{{ config(materialized='view') }}
+select id, value from {{ ref('my_seed') }} where id >= 1
+""".lstrip()
+
+MY_MV_ON_MY_VIEW_SQL = """
+{{ config(
+    materialized='materialized_view',
+    distributed_by=['id'],
+    refresh_method='manual'
+) }}
+select id, value from {{ ref('my_view') }}
 """.lstrip()
 
 
@@ -108,9 +111,27 @@ def _refresh_type(project, mv_name: str) -> str:
     return result[0].upper()
 
 
-# ---------------------------------------------------------------------------
-# Test: Option D — config change detection
-# ---------------------------------------------------------------------------
+def _server_version(project) -> tuple:
+    """Return the running StarRocks version as a (major, minor, patch) tuple."""
+    raw = project.run_sql("select current_version()", fetch="one")[0]
+    first = raw.split('-')[0].split(' ')[0]
+    parts = first.split('.')
+    if len(parts) == 3 and all(p.isdigit() for p in parts):
+        return tuple(int(p) for p in parts)
+    return (999, 999, 999)
+
+
+def _skip_if_before(project, version: tuple, reason: str) -> None:
+    """Skip the current test when the server is older than `version`.
+
+    Verbatim definition storage — which the SQL-comparison logic depends on —
+    only exists from 4.0.2 (materialized views, #64318) and 4.0.6 (views, #68040).
+    Below those versions StarRocks canonicalizes the stored SQL, so the no-op /
+    skip optimizations are intentionally disabled and these assertions don't hold.
+    """
+    if _server_version(project) < version:
+        pytest.skip(reason)
+
 
 class TestMaterializedViewConfigChangeDetection:
     """
@@ -118,9 +139,8 @@ class TestMaterializedViewConfigChangeDetection:
     distinguishes between unchanged config (no-op refresh) and changed config
     (drop+recreate).
 
-    This is the core fix for SSU-1881: previously the empty macro stub returned
-    "" which dbt treated as "changes present", causing every MV to be dropped
-    and recreated on every run.
+    Previously an empty macro stub returned "", which dbt treated as "changes
+    present", causing every MV to be dropped and recreated on every run.
     """
 
     @pytest.fixture(scope="class")
@@ -147,14 +167,21 @@ class TestMaterializedViewConfigChangeDetection:
         initial_model = get_model_file(project, my_mv)
         yield
         set_model_file(project, my_mv, initial_model)
-        project.run_sql(f"drop database if exists {project.test_schema}")
+        project.run_sql(f"drop database if exists {project.test_schema} force")
 
     def test_unchanged_config_is_noop(self, project, my_mv):
         """
         A second dbt run with no model changes must NOT drop+recreate the MV.
         get_materialized_view_configuration_changes should return none, dbt
         should take the REFRESH path (our no-op), and log 'Applying REFRESH to:'.
+
+        Only valid on >= 4.0.2: earlier versions canonicalize the stored MV
+        definition, so the SQL comparison can't detect "unchanged" and the
+        materialization intentionally rebuilds every run.
         """
+        _skip_if_before(project, (4, 0, 2),
+                        "MV no-op detection requires verbatim MV storage (>= 4.0.2)")
+
         _, logs = run_dbt_and_capture(["--debug", "run"])
 
         # The ALTER path is taken only when configuration changes are detected.
@@ -197,16 +224,10 @@ class TestMaterializedViewConfigChangeDetection:
         assert _is_active(project, "my_mv") == "true"
 
 
-# ---------------------------------------------------------------------------
-# Test: Option F — self-reactivation
-# ---------------------------------------------------------------------------
-
 class TestMaterializedViewSelfReactivation:
     """
     Tests that starrocks__get_materialized_view_configuration_changes reactivates
     an MV that was set IS_ACTIVE='false' by upstream view DDL in the same run.
-
-    This is Option F from the design doc (ssu-1881-mv-invalidation.md).
 
     Setup: my_seed → my_base_view (view) → my_mv_on_view (materialized_view).
     When dbt re-runs both models, it recreates my_base_view (DROP+CREATE), which
@@ -230,7 +251,7 @@ class TestMaterializedViewSelfReactivation:
         run_dbt(["seed"])
         run_dbt(["run"])
         yield
-        project.run_sql(f"drop database if exists {project.test_schema}")
+        project.run_sql(f"drop database if exists {project.test_schema} force")
 
     def test_mv_active_after_initial_run(self, project):
         """Sanity check: the MV should be active immediately after creation."""
@@ -239,22 +260,22 @@ class TestMaterializedViewSelfReactivation:
     def test_mv_stays_active_after_view_ddl_in_same_run(self, project):
         """
         A second full dbt run recreates my_base_view (which deactivates the MV),
-        then processes my_mv_on_view — Option F should reactivate it so the MV
-        is active at the end of the run.
+        then processes my_mv_on_view — the materialization should reactivate it so
+        the MV is active at the end of the run.
         """
         # Second run: view is recreated (deactivates MV), MV is then processed
-        # (Option F reactivates it, config unchanged → no-op refresh).
+        # (reactivated, config unchanged → no-op refresh).
         run_dbt(["run"])
 
         assert _is_active(project, "my_mv_on_view") == "true", (
-            "MV should be active after Option F reactivation in the same run"
+            "MV should be reactivated and active at the end of the same run"
         )
 
     def test_mv_reactivated_when_deactivated_before_mv_only_run(self, project):
         """
         When the MV is deactivated outside of dbt (simulated by manually
         dropping and recreating the upstream view) and then only the MV model
-        is run (not the view), Option F reactivates it.
+        is run (not the view), the materialization reactivates it.
         """
         schema = project.test_schema
 
@@ -273,9 +294,112 @@ class TestMaterializedViewSelfReactivation:
             "MV should be inactive after the view was externally dropped+recreated"
         )
 
-        # Run only the MV model — Option F should reactivate it.
+        # Run only the MV model — the materialization should reactivate it.
         run_dbt(["run", "--models", "my_mv_on_view"])
 
         assert _is_active(project, "my_mv_on_view") == "true", (
-            "MV should be active after Option F reactivation (MV-only run)"
+            "MV should be reactivated and active after an MV-only run"
+        )
+
+
+class TestViewSkipWhenUnchanged:
+    """
+    Tests the StarRocks view materialization's skip-when-unchanged behavior.
+
+    On >= 4.0.6 StarRocks stores the original view SQL verbatim, so the
+    materialization compares the stored definition against the compiled SQL and
+    issues no DDL when they match. Because StarRocks deactivates dependent MVs
+    whenever a base view is recreated, skipping the unchanged view keeps those
+    MVs active without relying on reactivation.
+
+    Setup: my_seed -> my_view (view) -> my_mv_on_view (materialized_view).
+    """
+
+    @pytest.fixture(scope="class")
+    def seeds(self):
+        return {"my_seed.csv": MY_SEED}
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "my_view.sql": MY_VIEW_SQL,
+            "my_mv_on_view.sql": MY_MV_ON_MY_VIEW_SQL,
+        }
+
+    @pytest.fixture(scope="class")
+    def my_view(self, project):
+        return project.adapter.Relation.create(
+            identifier="my_view",
+            schema=project.test_schema,
+            database=project.database,
+            type=RelationType.View,
+        )
+
+    @pytest.fixture(autouse=True)
+    def setup(self, project, my_view):
+        run_dbt(["seed"])
+        run_dbt(["run", "--full-refresh"])
+        initial_model = get_model_file(project, my_view)
+        yield
+        set_model_file(project, my_view, initial_model)
+        project.run_sql(f"drop database if exists {project.test_schema} force")
+
+    def test_unchanged_view_is_skipped(self, project, my_view):
+        """An unchanged view must issue no DDL — logged as 'skip <relation>'."""
+        _skip_if_before(project, (4, 0, 6),
+                        "view skip requires verbatim view storage (>= 4.0.6)")
+
+        _, logs = run_dbt_and_capture(["--debug", "run", "--select", "my_view"])
+
+        assert f"skip {my_view}" in logs, (
+            "an unchanged view should be skipped (no DDL issued)"
+        )
+
+    def test_unchanged_view_run_keeps_dependent_mv_active(self, project):
+        """
+        Running ONLY the (unchanged) view must not deactivate its dependent MV.
+        Because the MV model is not run here, MV self-reactivation cannot mask a
+        view rebuild — so the MV staying active proves the view was skipped.
+        """
+        _skip_if_before(project, (4, 0, 6),
+                        "view skip requires verbatim view storage (>= 4.0.6)")
+
+        run_dbt(["run", "--select", "my_view"])
+
+        assert _is_active(project, "my_mv_on_view") == "true", (
+            "dependent MV must stay active when the unchanged view is skipped"
+        )
+
+    def test_sql_change_rebuilds_view(self, project, my_view):
+        """
+        A genuine SQL change must rebuild the view (not skip it). Rebuilding the
+        view deactivates the dependent MV; running the MV afterwards reactivates
+        it so it ends up active again.
+        """
+        _skip_if_before(project, (4, 0, 6),
+                        "view skip requires verbatim view storage (>= 4.0.6)")
+
+        set_model_file(project, my_view, MY_VIEW_SQL_CHANGED)
+
+        # Rebuild just the view: the SQL changed, so it must not be skipped.
+        _, logs = run_dbt_and_capture(["--debug", "run", "--select", "my_view"])
+        assert f"skip {my_view}" not in logs, (
+            "a changed view must be rebuilt, not skipped"
+        )
+        stored = project.run_sql(
+            f"select view_definition from information_schema.views"
+            f" where table_schema = '{project.test_schema}' and table_name = 'my_view'",
+            fetch="one",
+        )[0]
+        assert "id >= 1" in stored, "rebuilt view should reflect the new SQL"
+
+        # Rebuilding the base view deactivates the dependent MV.
+        assert _is_active(project, "my_mv_on_view") == "false", (
+            "rebuilding the base view should deactivate the dependent MV"
+        )
+
+        # Running the MV reactivates it.
+        run_dbt(["run", "--select", "my_mv_on_view"])
+        assert _is_active(project, "my_mv_on_view") == "true", (
+            "dependent MV should be reactivated after it is run"
         )

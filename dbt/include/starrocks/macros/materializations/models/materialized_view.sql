@@ -72,22 +72,6 @@
   {%- endif -%}
 {% endmacro %}
 
-{% macro starrocks__normalize_mv_sql(s) -%}
-  {# Strip SQL comments and blank lines #}
-  {%- set ns = namespace(lines=[]) -%}
-  {%- for raw in s.split('\n') -%}
-    {%- set line = raw.strip() -%}
-    {%- if line.startswith('--') -%}
-    {%- elif '--' in line -%}
-      {%- set trimmed = line[:line.find('--')].strip() -%}
-      {%- if trimmed -%}{%- do ns.lines.append(trimmed) -%}{%- endif -%}
-    {%- elif line -%}
-      {%- do ns.lines.append(line) -%}
-    {%- endif -%}
-  {%- endfor -%}
-  {{- ns.lines | join('\n') -}}
-{%- endmacro %}
-
 {% macro starrocks__get_materialized_view_configuration_changes(existing_relation, new_config) %}
   {#
     Returns none when no changes are detected (dbt takes the no-op refresh path).
@@ -119,20 +103,25 @@
 
   {%- set changes = {} -%}
 
-  {%- set new_refresh = config.get('refresh_method', 'manual') | lower -%}
-  {%- if existing_refresh != new_refresh -%}
-    {%- do changes.update({'refresh_method': new_refresh}) -%}
-  {%- endif -%}
+  {%- if adapter.is_before_version("4.0.2") -%}
+    {# See https://github.com/StarRocks/starrocks/pull/64318 released in 4.0.2 #}
+    {%- do changes.update({'sql': true}) -%}
+  {%- else -%}
+    {%- set new_refresh = config.get('refresh_method', 'manual') | lower -%}
+    {%- if existing_refresh != new_refresh -%}
+      {%- do changes.update({'refresh_method': new_refresh}) -%}
+    {%- endif -%}
 
-  {%- set def_lower = existing_def.lower() -%}
-  {%- set as_pos = def_lower.find('\nas ') if def_lower.find('\nas ') >= 0 else def_lower.find('\nas\n') -%}
-  {%- if as_pos >= 0 -%}
-    {%- set stored_raw = existing_def[as_pos + 4:] | trim -%}
-    {%- set stored_sql = stored_raw[:-1] | trim if stored_raw.endswith(';') else stored_raw -%}
-    {%- set new_raw    = sql | trim -%}
-    {%- set new_sql    = new_raw[:-1] | trim if new_raw.endswith(';') else new_raw -%}
-    {%- if starrocks__normalize_mv_sql(stored_sql) != starrocks__normalize_mv_sql(new_sql) -%}
-      {%- do changes.update({'sql': true}) -%}
+    {%- set def_lower = existing_def.lower() -%}
+    {%- set as_pos = def_lower.find('\nas ') if def_lower.find('\nas ') >= 0 else def_lower.find('\nas\n') -%}
+    {%- if as_pos >= 0 -%}
+      {%- set stored_raw = existing_def[as_pos + 4:] | trim -%}
+      {%- set stored_sql = stored_raw[:-1] | trim if stored_raw.endswith(';') else stored_raw -%}
+      {%- set new_raw    = sql | trim -%}
+      {%- set new_sql    = new_raw[:-1] | trim if new_raw.endswith(';') else new_raw -%}
+      {%- if starrocks__normalize_sql(stored_sql) != starrocks__normalize_sql(new_sql) -%}
+        {%- do changes.update({'sql': true}) -%}
+      {%- endif -%}
     {%- endif -%}
   {%- endif -%}
 

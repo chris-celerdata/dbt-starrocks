@@ -17,18 +17,13 @@ DEFAULT = (999, 999, 999)
         ("4.0.6-abc", (4, 0, 6)),
         ("4.0.5-x", (4, 0, 5)),
         ("4.1.0-rc01", (4, 1, 0)),
-        # Two-digit patch / minor: the character-index parser used to read these
-        # as (3, 5, 1) and (4, 0, 1). Splitting on '.' fixes them.
         ("3.5.14-x", (3, 5, 14)),
         ("4.0.10-x", (4, 0, 10)),
         ("3.5.17-deadbeef", (3, 5, 17)),
-        # Bare version with no commit suffix (the old parser returned DEFAULT here).
         ("4.0.7", (4, 0, 7)),
-        # Space-separated trailing text.
         ("8.0.33 (StarRocks)", (8, 0, 33)),
         # Anything that is not exactly three numeric parts falls back to the
-        # sentinel default. (Two-part profile versions are handled separately in
-        # StarRocksConnectionManager.open, not by _parse_version.)
+        # sentinel default. 
         ("4.0", DEFAULT),
         ("3.5", DEFAULT),
         ("garbage", DEFAULT),

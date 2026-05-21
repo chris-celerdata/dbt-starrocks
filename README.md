@@ -45,6 +45,9 @@ $ pip install dbt-starrocks
 2. When StarRocks Version >= 2.5, `Create table as` supports table_type='PRIMARY'
 3. When StarRocks Version < 3.1 distributed_by is required
 4. Verify the specific `submit task` support for your version, see [SUBMIT TASK](https://docs.starrocks.io/docs/sql-reference/sql-statements/loading_unloading/ETL/SUBMIT_TASK/).
+5. Unchanged-relation detection depends on StarRocks storing the original SQL verbatim, which was added in **4.0.2** for materialized views ([StarRocks/starrocks#64318](https://github.com/StarRocks/starrocks/pull/64318)) and **4.0.6** for views ([StarRocks/starrocks#68040](https://github.com/StarRocks/starrocks/pull/68040)):
+   - **Views (>= 4.0.6):** when a view's SQL is unchanged, `dbt run` issues no DDL and reports `skip`. This avoids deactivating dependent materialized views, which StarRocks does whenever a base view is recreated, even with identical SQL. Below 4.0.6 the view is recreated every run (unchanged behavior).
+   - **Materialized views (>= 4.0.2):** an unchanged MV takes the no-op refresh path instead of being rebuilt. Below 4.0.2 the stored definition is canonicalized and cannot be compared, so the MV is rebuilt every run.
 
 ## Profile Configuration
 
