@@ -92,9 +92,7 @@
       ) -%}
     {%- endif -%}
 
-    {#-- `this` always addresses the internal catalog, so an external target has to be
-         looked up by the relation built above or it never appears to exist. --#}
-    {%- set existing_relation = load_relation(target_relation) if is_external else load_relation(this) -%}
+    {%- set existing_relation = load_relation(target_relation) -%}
     {%- set incremental_strategy = starrocks__validate_get_incremental_strategy(config) -%}
 
     {{ drop_relation_if_exists(tmp_relation) }}
