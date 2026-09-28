@@ -35,9 +35,9 @@
     {%- set keys = unique_key if unique_key is sequence and unique_key is not mapping and unique_key is not string else [unique_key] -%}
   {%- endif -%}
 
-  {# Derive table type from model contract constraints when no explicit keys configured #}
+  {# Derive table type from model contract constraints when no explicit table_type/keys configured #}
   {%- set contract_config = config.get('contract') -%}
-  {%- if contract_config and contract_config.enforced and keys is none -%}
+  {%- if contract_config and contract_config.enforced and keys is none and config.get('table_type') is none -%}
     {%- set ns = namespace(table_type=table_type, keys=none) -%}
 
     {# Model-level constraints take priority #}

@@ -39,7 +39,7 @@ $ pip install dbt-starrocks
 |        ❌         |         *4          |        *4        |        ✅         |            Submit task            |
 |        ❌         |          ✅          |        ✅         |        ✅         |  Microbatch (Insert Overwrite)   |
 |        ❌         |          ❌          |        ❌         |        ✅         | Microbatch (Dynamic Overwrite)   |
-|        ✅         |          ✅          |        ✅         |        ✅         |       Model contracts (constraints)        |
+|        ✅         |          ✅          |        ✅         |        ✅         |          Model contracts *7          |
 
 ### Notice
 1. When StarRocks Version < 2.5, `Create table as` can only set engine='OLAP' and table_type='DUPLICATE'
@@ -48,6 +48,7 @@ $ pip install dbt-starrocks
 4. Verify the specific `submit task` support for your version, see [SUBMIT TASK](https://docs.starrocks.io/docs/sql-reference/sql-statements/loading_unloading/ETL/SUBMIT_TASK/).
 5. **Views:** when a view's SQL is unchanged, `dbt run` issues no DDL on the view, leaving it in place (the run log notes `skip <view>`, and the model still completes as a successful no-op). This avoids deactivating dependent materialized views, which StarRocks does whenever a base view is recreated, even with identical SQL.
 6. `table_type` is case-insensitive — `'primary'`, `'PRIMARY'`, `'Primary'` are all accepted.
+7. Column names and data types are enforced; of the constraint types, only `primary_key` is applied (not enforced). See [Model Contracts and Constraints](#model-contracts-and-constraints).
 
 ## Profile Configuration
 
@@ -174,17 +175,21 @@ For more details on the different behaviors, see [StarRocks' documentation for I
 
 ## Model Contracts and Constraints
 
-dbt-starrocks supports [dbt model contracts](https://docs.getdbt.com/docs/collaborate/govern/model-contracts) with the following constraint types:
+dbt-starrocks supports [dbt model contracts](https://docs.getdbt.com/docs/collaborate/govern/model-contracts) for `table` and `incremental` models. With `contract.enforced: true`, dbt checks before building the table that the model's query returns exactly the columns declared in YAML, with matching data types, and fails the build otherwise. Types are compared by base type as reported by StarRocks, so `varchar(255)` and `varchar(65533)` are treated as the same type.
+
+Constraint support:
 
 | Constraint type | Support | Behavior |
 |---|---|---|
-| `not_null` | Enforced | Emits `NOT NULL` in column DDL |
-| `primary_key` | Enforced | Sets the table type to `PRIMARY KEY` and derives key columns |
+| `primary_key` | Not enforced | Sets the table type to `PRIMARY KEY` and derives key columns |
+| `not_null` | Not supported | Ignored; column nullability follows the query |
 | `unique` | Not supported | Ignored; table falls back to `DUPLICATE KEY` |
 | `check` | Not supported | Ignored |
 | `foreign_key` | Not supported | Ignored |
 
-> **Note:** StarRocks `PRIMARY KEY` tables use last-write-wins deduplication — they do not reject duplicate inserts.
+> **Note:** `primary_key` is *not enforced* because StarRocks `PRIMARY KEY` tables use last-write-wins deduplication: a duplicate key replaces the existing row instead of failing the build. Primary key columns are always `NOT NULL`.
+
+> **Note:** `not_null` is not supported because tables are built with `CREATE TABLE ... AS SELECT`, which cannot declare column nullability.
 
 ### Deriving table type from constraints
 
@@ -192,7 +197,8 @@ When `contract.enforced: true` is set and no explicit `table_type`/`keys` config
 
 - A `primary_key` constraint on one or more **columns** creates a `PRIMARY KEY` table keyed on those columns.
 - A model-level `primary_key` constraint (with a `columns` list) takes priority over column-level constraints.
-- Explicit `table_type` and `keys` config always win over constraints.
+- Explicit `table_type` or `keys` config always wins over constraints.
+- Primary key columns must come first in the model's `SELECT`, in the same order as the key. StarRocks rejects the table otherwise (`Key columns must be the first few columns of the schema`).
 
 **Column-level primary key:**
 ```yaml
@@ -208,8 +214,6 @@ models:
           - type: primary_key
       - name: name
         data_type: varchar(255)
-        constraints:
-          - type: not_null
 ```
 
 **Model-level primary key (multi-column):**

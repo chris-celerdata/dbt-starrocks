@@ -1,307 +1,255 @@
 import pytest
-from dbt.tests.util import run_dbt
+from dbt.tests.util import run_dbt, run_dbt_and_capture
 
-model_pk_constraint_sql = """
+# Seed columns are created nullable, so NOT NULL in a model's DDL can only come
+# from the table definition, not from CTAS type inference on constants.
+source_seed_csv = """
+id,name
+1,a
+2,b
+""".lstrip()
+
+default_model_sql = """
 {{ config(
     materialized='table',
     distributed_by=['id'],
 ) }}
-select 1 as id, 'hello' as name
+select id, name from {{ ref('source_seed') }}
 """.lstrip()
 
-pk_constraint_schema_yml = """
+
+def schema_yml(model_name, id_constraints="", name_constraints="", model_constraints="",
+               id_type="bigint", extra_columns=""):
+    return f"""
 version: 2
 models:
-  - name: model_pk_constraint
+  - name: {model_name}
     config:
       contract:
         enforced: true
+{model_constraints}
     columns:
       - name: id
-        data_type: int
+        data_type: {id_type}
+{id_constraints}
+      - name: name
+        data_type: varchar(255)
+{name_constraints}
+{extra_columns}
+""".lstrip()
+
+
+pk_column_constraint = """
         constraints:
           - type: primary_key
-      - name: name
-        data_type: varchar(255)
-""".lstrip()
+""".strip("\n")
 
-model_unique_constraint_sql = """
-{{ config(
-    materialized='table',
-    distributed_by=['id'],
-) }}
-select 1 as id, 'hello' as name
-""".lstrip()
-
-unique_constraint_schema_yml = """
-version: 2
-models:
-  - name: model_unique_constraint
-    config:
-      contract:
-        enforced: true
-    columns:
-      - name: id
-        data_type: int
-        constraints:
-          - type: unique
-      - name: name
-        data_type: varchar(255)
-""".lstrip()
-
-model_model_level_pk_sql = """
-{{ config(
-    materialized='table',
-    distributed_by=['id'],
-) }}
-select 1 as id, 'hello' as name
-""".lstrip()
-
-model_level_pk_schema_yml = """
-version: 2
-models:
-  - name: model_model_level_pk
-    config:
-      contract:
-        enforced: true
+pk_model_constraint = """
     constraints:
       - type: primary_key
         columns: [id]
-    columns:
-      - name: id
-        data_type: int
-      - name: name
-        data_type: varchar(255)
-""".lstrip()
+""".strip("\n")
 
-model_explicit_config_sql = """
+not_null_column_constraint = """
+        constraints:
+          - type: not_null
+""".strip("\n")
+
+unique_column_constraint = """
+        constraints:
+          - type: unique
+""".strip("\n")
+
+
+def show_create_table(project, relation):
+    return project.run_sql(f"SHOW CREATE TABLE {relation}", fetch="one")[1]
+
+
+def column_line(ddl, column):
+    """Return the DDL line defining `column`, so assertions target that column only."""
+    lines = [line for line in ddl.splitlines() if line.strip().startswith(f"`{column}`")]
+    assert len(lines) == 1, f"expected one definition of `{column}` in:\n{ddl}"
+    return lines[0]
+
+
+class ConstraintTestBase:
+    @pytest.fixture(scope="class")
+    def seeds(self):
+        return {"source_seed.csv": source_seed_csv}
+
+    def build(self, project):
+        run_dbt(["seed"])
+        results = run_dbt(["run"])
+        assert len(results) == 1
+        return show_create_table(project, results[0].node.relation_name)
+
+
+class TestColumnLevelPrimaryKey(ConstraintTestBase):
+    """Column-level primary_key constraint derives a PRIMARY KEY table; only the key is NOT NULL."""
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "model_pk_constraint.sql": default_model_sql,
+            "schema.yml": schema_yml("model_pk_constraint", id_constraints=pk_column_constraint),
+        }
+
+    def test_primary_key_table_type(self, project):
+        ddl = self.build(project)
+        assert "PRIMARY KEY(`id`)" in ddl
+        # StarRocks makes PRIMARY KEY columns NOT NULL; other columns keep the source's nullability
+        assert "NOT NULL" in column_line(ddl, "id")
+        assert "NOT NULL" not in column_line(ddl, "name")
+
+
+class TestModelLevelPrimaryKey(ConstraintTestBase):
+    """Model-level primary_key constraint derives a PRIMARY KEY table."""
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "model_model_level_pk.sql": default_model_sql,
+            "schema.yml": schema_yml("model_model_level_pk", model_constraints=pk_model_constraint),
+        }
+
+    def test_model_level_pk(self, project):
+        ddl = self.build(project)
+        assert "PRIMARY KEY(`id`)" in ddl
+
+
+class TestColumnLevelUniqueKey(ConstraintTestBase):
+    """Column-level unique constraint is not supported and does not change the table type."""
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "model_unique_constraint.sql": default_model_sql,
+            "schema.yml": schema_yml("model_unique_constraint", id_constraints=unique_column_constraint),
+        }
+
+    def test_unique_constraint_falls_back_to_duplicate(self, project):
+        ddl = self.build(project)
+        assert "DUPLICATE KEY" in ddl
+        assert "UNIQUE KEY" not in ddl
+        assert "PRIMARY KEY" not in ddl
+
+
+class TestNotNullNotApplied(ConstraintTestBase):
+    """not_null is not supported: CTAS cannot declare NOT NULL, so the column stays nullable."""
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "model_not_null.sql": default_model_sql,
+            "schema.yml": schema_yml("model_not_null", name_constraints=not_null_column_constraint),
+        }
+
+    def test_not_null_is_not_emitted(self, project):
+        ddl = self.build(project)
+        assert "NOT NULL" not in column_line(ddl, "name")
+
+
+class TestExplicitConfigOverridesConstraints(ConstraintTestBase):
+    """Explicit table_type/keys config takes priority over constraints."""
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "model_explicit_config.sql": """
 {{ config(
     materialized='table',
     table_type='DUPLICATE',
     keys=['id'],
     distributed_by=['id'],
 ) }}
-select 1 as id, 'hello' as name
-""".lstrip()
-
-explicit_config_schema_yml = """
-version: 2
-models:
-  - name: model_explicit_config
-    config:
-      contract:
-        enforced: true
-    columns:
-      - name: id
-        data_type: int
-        constraints:
-          - type: primary_key
-      - name: name
-        data_type: varchar(255)
-""".lstrip()
-
-
-model_not_null_sql = """
-{{ config(
-    materialized='table',
-    distributed_by=['id'],
-) }}
-select 1 as id, 'hello' as name
-""".lstrip()
-
-not_null_schema_yml = """
-version: 2
-models:
-  - name: model_not_null
-    config:
-      contract:
-        enforced: true
-    columns:
-      - name: id
-        data_type: int
-        constraints:
-          - type: not_null
-      - name: name
-        data_type: varchar(255)
-""".lstrip()
-
-model_pk_implicit_not_null_sql = """
-{{ config(
-    materialized='table',
-    distributed_by=['id'],
-) }}
-select 1 as id, 'hello' as name
-""".lstrip()
-
-pk_implicit_not_null_schema_yml = """
-version: 2
-models:
-  - name: model_pk_implicit_not_null
-    config:
-      contract:
-        enforced: true
-    columns:
-      - name: id
-        data_type: int
-        constraints:
-          - type: primary_key
-      - name: name
-        data_type: varchar(255)
-""".lstrip()
-
-model_pk_and_not_null_sql = """
-{{ config(
-    materialized='table',
-    distributed_by=['id'],
-) }}
-select 1 as id, 'hello' as name
-""".lstrip()
-
-pk_and_not_null_schema_yml = """
-version: 2
-models:
-  - name: model_pk_and_not_null
-    config:
-      contract:
-        enforced: true
-    columns:
-      - name: id
-        data_type: int
-        constraints:
-          - type: primary_key
-          - type: not_null
-      - name: name
-        data_type: varchar(255)
-""".lstrip()
-
-
-class TestNotNullConstraint:
-    """not_null constraint emits NOT NULL inline column DDL."""
-
-    @pytest.fixture(scope="class")
-    def models(self):
-        return {
-            "model_not_null.sql": model_not_null_sql,
-            "schema.yml": not_null_schema_yml,
-        }
-
-    def test_not_null_in_ddl(self, project):
-        results = run_dbt(["run"])
-        assert len(results) == 1
-        relation = results[0].node.relation_name
-        ddl = project.run_sql(f"SHOW CREATE TABLE {relation}", fetch="one")[1]
-        assert "NOT NULL" in ddl
-
-
-class TestColumnLevelPrimaryKey:
-    """Column-level primary_key constraint derives PRIMARY KEY table type."""
-
-    @pytest.fixture(scope="class")
-    def models(self):
-        return {
-            "model_pk_constraint.sql": model_pk_constraint_sql,
-            "schema.yml": pk_constraint_schema_yml,
-        }
-
-    def test_primary_key_table_type(self, project):
-        results = run_dbt(["run"])
-        assert len(results) == 1
-        relation = results[0].node.relation_name
-        ddl = project.run_sql(f"SHOW CREATE TABLE {relation}", fetch="one")[1]
-        assert "PRIMARY KEY" in ddl
-
-
-class TestColumnLevelUniqueKey:
-    """Column-level unique constraint is not supported — dbt warns and creates a DUPLICATE KEY table."""
-
-    @pytest.fixture(scope="class")
-    def models(self):
-        return {
-            "model_unique_constraint.sql": model_unique_constraint_sql,
-            "schema.yml": unique_constraint_schema_yml,
-        }
-
-    def test_unique_constraint_falls_back_to_duplicate(self, project):
-        results = run_dbt(["run"])
-        assert len(results) == 1
-        relation = results[0].node.relation_name
-        ddl = project.run_sql(f"SHOW CREATE TABLE {relation}", fetch="one")[1]
-        assert "DUPLICATE KEY" in ddl
-        assert "UNIQUE KEY" not in ddl
-
-
-class TestModelLevelPrimaryKey:
-    """Model-level primary_key constraint derives PRIMARY KEY table type."""
-
-    @pytest.fixture(scope="class")
-    def models(self):
-        return {
-            "model_model_level_pk.sql": model_model_level_pk_sql,
-            "schema.yml": model_level_pk_schema_yml,
-        }
-
-    def test_model_level_pk(self, project):
-        results = run_dbt(["run"])
-        assert len(results) == 1
-        relation = results[0].node.relation_name
-        ddl = project.run_sql(f"SHOW CREATE TABLE {relation}", fetch="one")[1]
-        assert "PRIMARY KEY" in ddl
-
-
-class TestExplicitConfigOverridesConstraints:
-    """Explicit table_type/keys config takes priority over constraints."""
-
-    @pytest.fixture(scope="class")
-    def models(self):
-        return {
-            "model_explicit_config.sql": model_explicit_config_sql,
-            "schema.yml": explicit_config_schema_yml,
+select id, name from {{ ref('source_seed') }}
+""".lstrip(),
+            "schema.yml": schema_yml("model_explicit_config", id_constraints=pk_column_constraint),
         }
 
     def test_explicit_config_wins(self, project):
-        results = run_dbt(["run"])
-        assert len(results) == 1
-        relation = results[0].node.relation_name
-        ddl = project.run_sql(f"SHOW CREATE TABLE {relation}", fetch="one")[1]
+        ddl = self.build(project)
+        assert "DUPLICATE KEY(`id`)" in ddl
+        assert "PRIMARY KEY" not in ddl
+
+
+class TestExplicitTableTypeOverridesConstraints(ConstraintTestBase):
+    """Explicit table_type without keys still takes priority over a primary_key constraint."""
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "model_explicit_table_type.sql": """
+{{ config(
+    materialized='table',
+    table_type='DUPLICATE',
+    distributed_by=['id'],
+) }}
+select id, name from {{ ref('source_seed') }}
+""".lstrip(),
+            "schema.yml": schema_yml("model_explicit_table_type", id_constraints=pk_column_constraint),
+        }
+
+    def test_explicit_table_type_wins(self, project):
+        ddl = self.build(project)
         assert "DUPLICATE KEY" in ddl
         assert "PRIMARY KEY" not in ddl
 
 
-class TestPrimaryKeyImplicitNotNull:
-    """PRIMARY KEY columns are implicitly NOT NULL in StarRocks even without an explicit not_null constraint."""
+class TestContractTypeMismatchFails(ConstraintTestBase):
+    """An enforced contract fails the build when a column's type differs from the YAML."""
 
     @pytest.fixture(scope="class")
     def models(self):
         return {
-            "model_pk_implicit_not_null.sql": model_pk_implicit_not_null_sql,
-            "schema.yml": pk_implicit_not_null_schema_yml,
+            "model_type_mismatch.sql": default_model_sql,
+            "schema.yml": schema_yml("model_type_mismatch", id_type="varchar(255)"),
         }
 
-    def test_pk_column_is_not_null(self, project):
-        results = run_dbt(["run"])
-        assert len(results) == 1
-        relation = results[0].node.relation_name
-        ddl = project.run_sql(f"SHOW CREATE TABLE {relation}", fetch="one")[1]
-        assert "PRIMARY KEY" in ddl
-        # StarRocks implicitly enforces NOT NULL on all PRIMARY KEY columns
-        assert "`id`" in ddl and "NOT NULL" in ddl
+    def test_type_mismatch_fails(self, project):
+        run_dbt(["seed"])
+        _, log = run_dbt_and_capture(["run"], expect_pass=False)
+        assert "contract" in log.lower()
+        assert "data type mismatch" in log.lower()
 
 
-class TestPrimaryKeyAndNotNullCombined:
-    """Combining primary_key and not_null on the same column is redundant but accepted by StarRocks."""
+class TestContractMissingColumnFails(ConstraintTestBase):
+    """An enforced contract fails the build when the query lacks a declared column."""
 
     @pytest.fixture(scope="class")
     def models(self):
         return {
-            "model_pk_and_not_null.sql": model_pk_and_not_null_sql,
-            "schema.yml": pk_and_not_null_schema_yml,
+            "model_missing_column.sql": default_model_sql,
+            "schema.yml": schema_yml(
+                "model_missing_column",
+                extra_columns="      - name: created_at\n        data_type: datetime",
+            ),
         }
 
-    def test_pk_and_not_null_succeeds(self, project):
-        results = run_dbt(["run"])
-        assert len(results) == 1
-        relation = results[0].node.relation_name
-        ddl = project.run_sql(f"SHOW CREATE TABLE {relation}", fetch="one")[1]
-        assert "PRIMARY KEY" in ddl
-        # Redundant NOT NULL on a PK column is accepted without error
-        assert "`id`" in ddl and "NOT NULL" in ddl
+    def test_missing_column_fails(self, project):
+        run_dbt(["seed"])
+        _, log = run_dbt_and_capture(["run"], expect_pass=False)
+        assert "contract" in log.lower()
+        assert "created_at" in log
+
+
+class TestPrimaryKeyMustBeSelectedFirst(ConstraintTestBase):
+    """StarRocks requires PRIMARY KEY columns to lead the schema, so the SELECT order matters."""
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "model_pk_not_first.sql": """
+{{ config(
+    materialized='table',
+    distributed_by=['id'],
+) }}
+select name, id from {{ ref('source_seed') }}
+""".lstrip(),
+            "schema.yml": schema_yml("model_pk_not_first", id_constraints=pk_column_constraint),
+        }
+
+    def test_pk_not_first_fails(self, project):
+        run_dbt(["seed"])
+        _, log = run_dbt_and_capture(["run"], expect_pass=False)
+        assert "Key columns must be the first few columns" in log

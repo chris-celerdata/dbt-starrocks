@@ -65,26 +65,16 @@ class StarRocksAdapter(SQLAdapter):
     AdapterSpecificConfigs = StarRocksConfig
     Column = StarRocksColumn
 
+    # Tables are built with CTAS, whose column list cannot carry NOT NULL, so not_null
+    # is unsupported. primary_key is applied via the table key type in starrocks__olap_table;
+    # it is NOT_ENFORCED because PRIMARY KEY tables upsert duplicates rather than reject them.
     CONSTRAINT_SUPPORT = {
         ConstraintType.check: ConstraintSupport.NOT_SUPPORTED,
-        ConstraintType.not_null: ConstraintSupport.ENFORCED,
+        ConstraintType.not_null: ConstraintSupport.NOT_SUPPORTED,
         ConstraintType.unique: ConstraintSupport.NOT_SUPPORTED,
-        ConstraintType.primary_key: ConstraintSupport.ENFORCED,
+        ConstraintType.primary_key: ConstraintSupport.NOT_ENFORCED,
         ConstraintType.foreign_key: ConstraintSupport.NOT_SUPPORTED,
     }
-
-    @classmethod
-    def render_column_constraint(cls, constraint):
-        # NOT NULL is supported as inline column DDL in StarRocks.
-        # primary_key/unique are expressed via table key type in starrocks__olap_table,
-        # not as inline column constraints, so they return None.
-        if constraint.type == ConstraintType.not_null:
-            return "NOT NULL"
-        return None
-
-    @classmethod
-    def render_model_constraint(cls, constraint):
-        return None
 
     _running_tasks: Dict[str, str] = {}
 

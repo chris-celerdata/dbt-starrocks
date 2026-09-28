@@ -8,7 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Model contract constraint support: `not_null` constraints emit `NOT NULL` inline column DDL; `primary_key` constraints (column- or model-level) automatically derive a `PRIMARY KEY` table type and key columns
+- Model contract enforcement: with `contract.enforced: true`, table and incremental builds fail when the model's columns or data types differ from the YAML definition
+- `primary_key` constraints (column- or model-level) on contracted models automatically derive a `PRIMARY KEY` table type and key columns
 - `table_type` config is now case-insensitive (`'duplicate'`, `'primary'`, `'unique'` are all accepted)
 
 ## [1.12.0] - 2026-06-10
