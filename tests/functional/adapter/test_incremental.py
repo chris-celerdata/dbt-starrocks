@@ -400,3 +400,87 @@ class TestMergeAcceptsExistingUniqueKeyTable(TestMergeStrategyIncrementalModel):
         relation = relation_from_name(project.adapter, "merge_model")
         result = project.run_sql(f"select id, value from {relation} order by id", fetch="all")
         assert result == [(1, 10), (2, 200), (3, 300), (4, 40)]
+
+
+delete_insert_base_csv = """
+id,day,value
+1,1,10
+2,1,20
+3,1,30
+4,2,40
+""".lstrip()
+
+delete_insert_update_csv = """
+id,day,value
+2,1,200
+5,1,50
+""".lstrip()
+
+delete_insert_model_template = """
+{{{{ config(materialized='incremental', incremental_strategy='delete+insert', {config}) }}}}
+select id, day, value from {{{{ ref(var('seed_name', 'delete_insert_base')) }}}}
+""".lstrip()
+
+
+class TestDeleteInsertStrategyIncrementalModel:
+    """'delete+insert' deletes target rows whose unique_key appears in the new data, then
+    inserts the new data. With explicit PRIMARY KEY `keys`, unique_key can be coarser than
+    the key: here every row of a day is replaced, including rows the new data omits."""
+
+    @pytest.fixture(scope="class")
+    def seeds(self):
+        return {
+            "delete_insert_base.csv": delete_insert_base_csv,
+            "delete_insert_update.csv": delete_insert_update_csv,
+        }
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            # unique_key becomes the PRIMARY KEY, as under 'merge'.
+            "by_unique_key.sql": delete_insert_model_template.format(
+                config="unique_key=['id', 'day']"),
+            # The table keeps (id, day) as its PRIMARY KEY; rows are replaced per day.
+            "by_day.sql": delete_insert_model_template.format(
+                config="table_type='PRIMARY', keys=['id', 'day'], unique_key='day'"),
+            # Predicates narrow the delete: only rows of day 1 with value < 25 go.
+            "by_day_with_predicate.sql": delete_insert_model_template.format(
+                config="table_type='PRIMARY', keys=['id', 'day'], unique_key='day', "
+                       "incremental_predicates=['value < 25']"),
+        }
+
+    def _rows(self, project, name):
+        relation = relation_from_name(project.adapter, name)
+        return project.run_sql(f"select id, value from {relation} order by id", fetch="all")
+
+    def test_delete_insert(self, project):
+        assert len(run_dbt(["seed"])) == 2
+        assert len(run_dbt(["run"])) == 3
+        assert len(run_dbt(["run", "--vars", "seed_name: delete_insert_update"])) == 3
+
+        assert self._rows(project, "by_unique_key") == [(1, 10), (2, 200), (3, 30), (4, 40), (5, 50)]
+        # Ids 1 and 3 are gone: day 1 was replaced wholesale.
+        assert self._rows(project, "by_day") == [(2, 200), (4, 40), (5, 50)]
+        # Id 3 (value 30) survives the predicate.
+        assert self._rows(project, "by_day_with_predicate") == [(2, 200), (3, 30), (4, 40), (5, 50)]
+
+
+class TestDeleteInsertStrategyValidation:
+
+    @pytest.fixture(scope="class")
+    def seeds(self):
+        return {"delete_insert_base.csv": delete_insert_base_csv}
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "no_unique_key.sql": delete_insert_model_template.format(config="keys=['id']"),
+            "duplicate_keys.sql": delete_insert_model_template.format(
+                config="keys=['id'], unique_key='day'"),
+        }
+
+    def test_validation(self, project):
+        run_dbt(["seed"])
+        results = {r.node.name: r.message for r in run_dbt(["run"], expect_pass=False)}
+        assert "requires the 'unique_key' configuration" in results["no_unique_key"]
+        assert "requires a PRIMARY KEY table" in results["duplicate_keys"]

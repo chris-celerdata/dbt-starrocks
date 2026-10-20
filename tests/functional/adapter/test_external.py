@@ -257,3 +257,101 @@ class TestExternalCatalogIncrementalCustomSchema:
             "incremental_custom_schema"
         ]
         assert self._tables(project, project.test_schema) == []
+
+
+delete_insert_seed_base_csv = """
+id,value
+1,10
+2,20
+3,30
+""".lstrip()
+
+delete_insert_seed_update_csv = """
+id,value
+2,200
+4,40
+""".lstrip()
+
+external_delete_insert_sql = """
+{{{{
+    config(
+        materialized = 'incremental',
+        incremental_strategy = 'delete+insert',
+        catalog = 'iceberg_catalog',
+        database = 'dbt_test_delete_insert',
+        unique_key = 'id',
+        {extra}
+    )
+}}}}
+select id, value from {{{{ ref(var('seed_name', 'delete_insert_base')) }}}}
+""".lstrip()
+
+
+class TestExternalCatalogDeleteInsert:
+    """'delete+insert' on Iceberg needs StarRocks 4.1, which added Iceberg DELETE. Older
+    versions must fail with a clear message rather than a StarRocks analysis error.
+
+    incremental_predicates are refused on every version: StarRocks drops the unique_key
+    subquery from an Iceberg DELETE that also has another condition, deleting every row
+    that matches the condition instead."""
+
+    @pytest.fixture(scope="class")
+    def seeds(self):
+        return {
+            "delete_insert_base.csv": delete_insert_seed_base_csv,
+            "delete_insert_update.csv": delete_insert_seed_update_csv,
+        }
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "external_delete_insert.sql": external_delete_insert_sql.format(extra=""),
+            "external_delete_insert_predicates.sql": external_delete_insert_sql.format(
+                extra="incremental_predicates = ['value > 0'],"),
+        }
+
+    @pytest.fixture(scope="class", autouse=True)
+    def setup_external_catalog(self, project):
+        project.run_sql("""
+            CREATE DATABASE IF NOT EXISTS iceberg_catalog.dbt_test_delete_insert
+            PROPERTIES ("location" = "s3://warehouse/dbt_test_delete_insert")
+        """)
+        yield
+
+        # A failed run can leave its temp table behind, and an Iceberg database must be
+        # empty to drop.
+        for (table,) in project.run_sql("SHOW TABLES FROM iceberg_catalog.dbt_test_delete_insert", fetch="all"):
+            project.run_sql(f"DROP TABLE iceberg_catalog.dbt_test_delete_insert.{table} FORCE")
+        project.run_sql("DROP DATABASE IF EXISTS iceberg_catalog.dbt_test_delete_insert")
+
+    @staticmethod
+    def _supports_iceberg_delete(project):
+        version = project.run_sql("select current_version()", fetch="one")[0]
+        major, minor = (int(part) for part in version.split(".")[:2])
+        return (major, minor) >= (4, 1)
+
+    def test_delete_insert(self, project):
+        assert len(run_dbt(["seed"])) == 2
+
+        if not self._supports_iceberg_delete(project):
+            # Refused up front, before a table is built that could never be updated.
+            results = run_dbt(["run", "--select", "external_delete_insert"], expect_pass=False)
+            assert "requires StarRocks 4.1 or later" in results[0].message
+            return
+
+        assert len(run_dbt(["run", "--select", "external_delete_insert"])) == 1
+        assert len(run_dbt(
+            ["run", "--select", "external_delete_insert", "--vars", "seed_name: delete_insert_update"]
+        )) == 1
+        rows = project.run_sql(
+            "select id, value from iceberg_catalog.dbt_test_delete_insert.external_delete_insert order by id",
+            fetch="all",
+        )
+        assert rows == [(1, 10), (2, 200), (3, 30), (4, 40)]
+
+    def test_incremental_predicates_refused(self, project):
+        run_dbt(["seed"])
+        results = run_dbt(["run", "--select", "external_delete_insert_predicates"], expect_pass=False)
+        expected = ("does not support 'incremental_predicates'" if self._supports_iceberg_delete(project)
+                    else "requires StarRocks 4.1 or later")
+        assert expected in results[0].message

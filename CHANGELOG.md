@@ -20,7 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   PRIMARY or UNIQUE KEY table, where the insert would upsert, and `merge` fails on any other
   table type and in external catalogs. `merge` raises on `merge_update_columns`,
   `merge_exclude_columns` and `incremental_predicates`, which need a `MERGE` statement.
-- `append` and `merge` check the existing table's key type on each incremental run, so a
+- `delete+insert` incremental strategy: deletes target rows whose `unique_key` matches the new
+  data, then inserts it. In `default_catalog` it needs a PRIMARY KEY table; with
+  `table_type='PRIMARY'` and `keys`, `unique_key` can be a coarser grain than the key. In
+  external catalogs (Iceberg) it needs StarRocks >= 4.1, and `incremental_predicates` are
+  refused because StarRocks deletes too much when they are combined with the `unique_key`
+  match on an Iceberg table.
+- `append`, `merge` and `delete+insert` check the existing table's key type on each incremental run, so a
   table built before its key config changed fails with a pointer to `--full-refresh`
   instead of silently appending or upserting.
 

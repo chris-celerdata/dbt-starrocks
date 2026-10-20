@@ -441,6 +441,7 @@ class StarRocksAdapter(SQLAdapter):
             "default",
             "append",
             "merge",
+            "delete+insert",
             "insert_overwrite",
             "dynamic_overwrite",
             "microbatch",

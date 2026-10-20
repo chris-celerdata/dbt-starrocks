@@ -71,6 +71,51 @@
     {%- endfor -%}
 {%- endmacro -%}
 
+{%- macro starrocks__validate_delete_insert_config(config, is_external) -%}
+    {%- if config.get('unique_key') is none -%}
+        {%- do exceptions.raise_compiler_error("The 'delete+insert' incremental strategy requires the 'unique_key' configuration to be set.") -%}
+    {%- endif -%}
+
+    {%- if is_external -%}
+        {%- if adapter.is_before_version("4.1.0") -%}
+            {%- set msg -%}
+                The 'delete+insert' incremental strategy requires StarRocks 4.1 or later for models in an
+                external catalog, which is when StarRocks added DELETE for Iceberg tables. Current version
+                is {{ adapter.current_version() }}. Use 'insert_overwrite' or 'dynamic_overwrite' instead.
+            {%- endset -%}
+            {%- do exceptions.raise_compiler_error(msg) -%}
+        {%- endif -%}
+
+        {#--
+            StarRocks plans an Iceberg DELETE whose WHERE combines `IN (subquery)` with another
+            condition as a file-level delete on that condition alone, dropping the subquery and
+            deleting every row that matches it. Refuse rather than risk that data loss.
+        --#}
+        {%- if config.get('incremental_predicates') or config.get('predicates') -%}
+            {%- set msg -%}
+                The 'delete+insert' incremental strategy does not support 'incremental_predicates' for
+                models in an external catalog. StarRocks ignores the unique_key match when a DELETE on
+                an Iceberg table combines it with another condition, and deletes every row matching
+                the condition instead.
+            {%- endset -%}
+            {%- do exceptions.raise_compiler_error(msg) -%}
+        {%- endif -%}
+
+    {#--
+        In default_catalog, StarRocks only accepts a DELETE driven by a subquery on PRIMARY
+        KEY tables. With explicit `keys` the table keeps them as its key, so its type has to
+        be PRIMARY too.
+    --#}
+    {%- elif starrocks__incremental_table_type(config) != 'PRIMARY' -%}
+        {%- set msg -%}
+            The 'delete+insert' incremental strategy requires a PRIMARY KEY table, because StarRocks
+            only supports deleting rows matched by a subquery on PRIMARY KEY tables. Set
+            table_type='PRIMARY' alongside 'keys', or drop 'keys' to make 'unique_key' the PRIMARY KEY.
+        {%- endset -%}
+        {%- do exceptions.raise_compiler_error(msg) -%}
+    {%- endif -%}
+{%- endmacro -%}
+
 {#--
     'default' is slated for deprecation. Announce it as an info log rather than a warning,
     so projects running with --warn-error are not broken before the deprecation lands.
@@ -116,6 +161,8 @@
         {%- do starrocks__validate_append_config(config) -%}
     {%- elif strategy == 'merge' -%}
         {%- do starrocks__validate_merge_config(config) -%}
+    {%- elif strategy == 'delete+insert' -%}
+        {%- do starrocks__validate_delete_insert_config(config, is_external) -%}
     {%- endif -%}
     {%- do return (strategy) -%}
 {%- endmacro -%}
@@ -132,6 +179,7 @@
     {%- set allowed = {
         'append': ['DUP_KEYS'],
         'merge': ['PRIMARY_KEYS', 'UNIQUE_KEYS'],
+        'delete+insert': ['PRIMARY_KEYS'],
     }.get(strategy) -%}
     {%- if allowed is none -%}
         {%- do return(none) -%}

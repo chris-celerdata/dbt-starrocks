@@ -29,6 +29,27 @@
     {%- do return(get_incremental_append_sql(arg_dict)) -%}
 {%- endmacro -%}
 
+{%- macro starrocks__get_incremental_delete_insert_sql(arg_dict) -%}
+    {#--
+        Two statements, not one transaction: StarRocks rejects a DELETE followed by an INSERT
+        on the same table inside an explicit transaction, in default_catalog and in Iceberg
+        catalogs alike. The DELETE runs here and the INSERT is returned as the model's main
+        statement. dbt's default macro does not apply: StarRocks rejects `DELETE ... AS alias`.
+    --#}
+    {%- set unique_key_csv = arg_dict["unique_key"] | join(", ") -%}
+    {%- call statement('delete_by_unique_key') -%}
+        delete from {{ arg_dict["target_relation"] }}
+        where ({{ unique_key_csv }}) in (
+            select distinct {{ unique_key_csv }}
+            from {{ arg_dict["temp_relation"] }}
+        )
+        {%- for predicate in arg_dict["incremental_predicates"] or [] %}
+        and {{ predicate }}
+        {%- endfor %}
+    {%- endcall -%}
+    {%- do return(get_incremental_append_sql(arg_dict)) -%}
+{%- endmacro -%}
+
 {%- macro get_incremental_insert_overwrite_sql(arg_dict) -%}
     {%- do return(get_insert_overwrite_into_sql(arg_dict["target_relation"], arg_dict["temp_relation"], arg_dict["dest_columns"])) -%}
 {%- endmacro -%}

@@ -15,6 +15,19 @@
  */
 
 {#--
+    Whether `unique_key` becomes the PRIMARY KEY of the table starrocks__olap_table builds.
+    It does, except under 'delete+insert' with explicit `keys`: there `unique_key` is the
+    grain rows are deleted at, which need not be unique, and the table keeps `keys` as its
+    PRIMARY KEY.
+--#}
+{% macro starrocks__incremental_promotes_unique_key(config) -%}
+  {%- do return(
+      config.get('unique_key') is not none
+      and not (config.get('incremental_strategy') == 'delete+insert' and config.get('keys') is not none)
+  ) -%}
+{%- endmacro %}
+
+{#--
     The table type ('DUPLICATE', 'PRIMARY' or 'UNIQUE') and key columns the model's config
     builds, as {'table_type': ..., 'keys': ...}. starrocks__olap_table builds from this, and
     the incremental strategies validate against it, so the two cannot disagree.
@@ -25,7 +38,7 @@
   {%- set materialized = config.get('materialized', none) -%}
   {%- set unique_key = config.get('unique_key', none) -%}
 
-  {%- if materialized == 'incremental' and unique_key is not none -%}
+  {%- if materialized == 'incremental' and starrocks__incremental_promotes_unique_key(config) -%}
     {%- set table_type = 'PRIMARY' -%}
     {%- set keys = unique_key if unique_key is sequence and unique_key is not mapping and unique_key is not string else [unique_key] -%}
   {%- endif -%}

@@ -131,7 +131,7 @@ models:
   on_view_exists: 'replace'             // only for view: use CREATE OR REPLACE VIEW instead of DROP + CREATE
 
   // For 'materialized=incremental'
-  incremental_strategy: 'merge'           // Supported values: ['default', 'append', 'merge', 'insert_overwrite', 'dynamic_overwrite', 'microbatch'] ('default' will be deprecated)
+  incremental_strategy: 'merge'           // Supported values: ['default', 'append', 'merge', 'delete+insert', 'insert_overwrite', 'dynamic_overwrite', 'microbatch'] ('default' will be deprecated)
   unique_key: ['id']                      // Makes the table PRIMARY KEY, as 'merge' requires; not allowed with 'append'
   // 'insert_overwrite' and 'dynamic_overwrite' require version >= 3.4
 
@@ -221,6 +221,8 @@ The `incremental_strategy` config supports the following values:
   Requires a DUPLICATE KEY table, so `unique_key` cannot be set.
 - `merge`: Upsert on the table's PRIMARY KEY. Requires a PRIMARY KEY table: set `unique_key`,
   `table_type='PRIMARY'` with `keys`, or an enforced contract with a `primary_key` constraint.
+- `delete+insert`: Deletes target rows whose `unique_key` appears in the new data, then inserts
+  the new data. Requires `unique_key`. See below.
 - `insert_overwrite`: Applies `overwrite` with `dynamic_overwrite = false` (StarRocks >= 3.4).
 - `dynamic_overwrite`: Applies `overwrite` with `dynamic_overwrite = true` (StarRocks >= 3.4).
 - `microbatch`: Processes the model in time-based batches; see the microbatch configs above.
@@ -258,6 +260,33 @@ How this differs from `merge` on other dbt adapters:
   it, is accepted too: an `INSERT` replaces its rows by key in the same way.
 
 `merge` is not supported for models in an external catalog, whose tables have no PRIMARY KEY.
+
+### How `delete+insert` works
+Two statements run in order: a `DELETE` of every target row whose `unique_key` matches a row in
+the new data, then an `INSERT` of the new data. Unlike `merge`, `unique_key` can be coarser than
+the table's key: `unique_key='event_date'` replaces every row of each date the new data
+contains, including rows it no longer has.
+
+StarRocks cannot run the two statements in one transaction, so a query that reads the table
+between them sees the deleted rows missing.
+
+- **`default_catalog`:** the table must be a PRIMARY KEY table, the only table type StarRocks can
+  delete from by subquery. Either set `unique_key` alone, which becomes the PRIMARY KEY (rows
+  are then replaced one for one, as with `merge`), or set `table_type='PRIMARY'` with `keys`,
+  which stay the PRIMARY KEY while `unique_key` sets the grain rows are deleted at.
+  `incremental_predicates` narrow the delete.
+- **External catalogs (Iceberg):** requires StarRocks >= 4.1, which added `DELETE` for Iceberg,
+  and an Iceberg format v2 table (the default for tables StarRocks creates).
+  `incremental_predicates` are not supported: StarRocks mishandles a `DELETE` on an Iceberg table
+  that combines the `unique_key` match with another condition, deleting every row matching the
+  condition, so the adapter refuses the configuration.
+
+```
+{{ config(materialized='incremental', incremental_strategy='delete+insert',
+          table_type='PRIMARY', keys=['event_id', 'event_date'], unique_key='event_date') }}
+{{ config(materialized='incremental', incremental_strategy='delete+insert',
+          catalog='iceberg_catalog', database='iceberg_db', unique_key='event_id') }}
+```
 
 ### `default` will be deprecated
 `default`, which is also what you get when `incremental_strategy` is not set, runs a plain
