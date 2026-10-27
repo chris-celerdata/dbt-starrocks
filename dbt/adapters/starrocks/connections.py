@@ -213,9 +213,7 @@ class StarRocksConnectionManager(SQLConnectionManager):
             cursor = connection.handle.cursor()
             try:
                 cursor.execute("select current_version()")
-                starrocks_version_str = cursor.fetchone()[0]
-                connection.starrocks_version = _parse_version(starrocks_version_str)
-                connection.starrocks_version_string = starrocks_version_str
+                connection.starrocks_version = _parse_version(cursor.fetchone()[0])
             except Exception as e:
                 logger.debug(
                     "Got an error when obtain StarRocks version exception: '{}'".format(e))
@@ -224,11 +222,9 @@ class StarRocksConnectionManager(SQLConnectionManager):
             if len(version) == 3:
                 connection.starrocks_version = (
                     int(version[0]), int(version[1]), int(version[2]))
-                connection.starrocks_version_string = credentials.version.strip()
             elif len(version) == 2:
                 connection.starrocks_version = (
                     int(version[0]), int(version[1]), 0)
-                connection.starrocks_version_string = credentials.version.strip()
             else:
                 logger.debug("Config version '{}' is invalid".format(version))
 

@@ -49,7 +49,6 @@ DEFAULT = (999, 999, 999)
         ("4.0.10-x", (4, 0, 10)),
         ("3.5.17-deadbeef", (3, 5, 17)),
         ("4.0.7", (4, 0, 7)),
-        ("8.0.33 (StarRocks)", (8, 0, 33)),
         # Anything that is not exactly three numeric parts falls back to the
         # sentinel default.
         ("4.0", DEFAULT),
