@@ -365,3 +365,38 @@ class TestStrategyChecksExistingTableType:
         # A full refresh rebuilds it as PRIMARY KEY, after which merge runs.
         run_dbt(["run", "--vars", "strategy: merge", "--full-refresh"])
         run_dbt(["run", "--vars", "strategy: merge"])
+
+
+class TestMergeRejectsIncrementalPredicates(TestMergeStrategyIncrementalModel):
+    """'merge' matches on the PRIMARY KEY alone, so extra match conditions are refused rather
+    than silently ignored."""
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {"merge_model.sql": merge_model_sql.replace(
+            "unique_key=['id', 'partition_key'],",
+            "unique_key=['id', 'partition_key'], incremental_predicates=['value > 0'],",
+        )}
+
+    def test_merge_upserts_on_unique_key(self, project):
+        run_dbt(["seed"])
+        results = run_dbt(["run"], expect_pass=False)
+        assert "does not support 'incremental_predicates'" in results[0].message
+
+
+class TestMergeAcceptsExistingUniqueKeyTable(TestMergeStrategyIncrementalModel):
+    """dbt cannot build a UNIQUE KEY table (StarRocks CTAS rejects them), but 'merge' accepts one
+    created outside dbt, since an INSERT replaces its rows by key too."""
+
+    def test_merge_upserts_on_unique_key(self, project):
+        assert len(run_dbt(["seed"])) == 2
+        project.run_sql(f"""
+            create table {project.test_schema}.merge_model (id bigint, partition_key bigint, value bigint)
+            UNIQUE KEY(id, partition_key) DISTRIBUTED BY HASH(id)
+        """)
+        project.run_sql(f"insert into {project.test_schema}.merge_model values (1, 1, 10), (2, 1, 20)")
+
+        assert len(run_dbt(["run", "--vars", "seed_name: merge_updated"])) == 1
+        relation = relation_from_name(project.adapter, "merge_model")
+        result = project.run_sql(f"select id, value from {relation} order by id", fetch="all")
+        assert result == [(1, 10), (2, 200), (3, 300), (4, 40)]

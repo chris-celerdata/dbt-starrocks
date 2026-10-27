@@ -13,15 +13,11 @@
 {%- endmacro -%}
 
 {#--
-    The StarRocks table type an incremental model's config builds: 'PRIMARY',
-    'UNIQUE' or 'DUPLICATE'. Mirrors starrocks__olap_table, where `unique_key`
-    promotes the target to a PRIMARY KEY table keyed on it.
+    The StarRocks table type an incremental model's config builds: 'PRIMARY', 'UNIQUE' or
+    'DUPLICATE', as starrocks__olap_table builds it.
 --#}
 {%- macro starrocks__incremental_table_type(config) -%}
-    {%- if config.get('unique_key') is not none -%}
-        {%- do return('PRIMARY') -%}
-    {%- endif -%}
-    {%- do return(config.get('table_type', 'DUPLICATE') | upper) -%}
+    {%- do return(starrocks__olap_table_type_and_keys()['table_type']) -%}
 {%- endmacro -%}
 
 {%- macro starrocks__validate_microbatch_config(config) -%}
@@ -50,22 +46,25 @@
     {%- if starrocks__incremental_table_type(config) != 'PRIMARY' -%}
         {%- set msg -%}
             The 'merge' incremental strategy requires a PRIMARY KEY table. Set 'unique_key', which
-            becomes the table's PRIMARY KEY, or table_type='PRIMARY' with 'keys'.
+            becomes the table's PRIMARY KEY, table_type='PRIMARY' with 'keys', or an enforced
+            contract with a primary_key constraint.
         {%- endset -%}
         {%- do exceptions.raise_compiler_error(msg) -%}
     {%- endif -%}
 
     {#--
-        StarRocks has no MERGE statement. The upsert is an INSERT INTO a PRIMARY KEY
-        table, which always replaces the whole row, so per-column merge configs cannot
-        be honoured. Fail loudly rather than silently ignoring them.
+        StarRocks has no MERGE statement. The upsert is an INSERT INTO a PRIMARY KEY table,
+        which writes the same columns to matched and new rows and matches on the table's key
+        alone. Configs that need a MERGE (different columns for matched rows, or extra match
+        conditions) cannot be honoured, so fail loudly rather than silently ignoring them.
     --#}
-    {%- for key in ['merge_update_columns', 'merge_exclude_columns'] -%}
+    {%- for key in ['merge_update_columns', 'merge_exclude_columns', 'incremental_predicates', 'predicates'] -%}
         {%- if config.get(key) -%}
             {%- set msg -%}
                 The 'merge' incremental strategy does not support '{{ key }}' on StarRocks.
                 StarRocks has no MERGE statement: the upsert is an INSERT INTO a PRIMARY KEY
-                table, which always replaces the whole row.
+                table, which writes the same columns to matched and new rows and matches on the
+                table's PRIMARY KEY alone.
             {%- endset -%}
             {%- do exceptions.raise_compiler_error(msg) -%}
         {%- endif -%}
@@ -127,20 +126,23 @@
     rebuilds it. Check the live table so the strategy cannot silently do something else.
 --#}
 {%- macro starrocks__validate_incremental_target_table_type(strategy, relation) -%}
-    {%- set required = {
-        'append': 'DUP_KEYS',
-        'merge': 'PRIMARY_KEYS',
+    {#-- 'merge' also accepts a UNIQUE KEY table, where an INSERT replaces rows by key as on a
+         PRIMARY KEY table. dbt cannot build one (StarRocks CTAS rejects UNIQUE KEY), but a
+         table created outside dbt can be one. --#}
+    {%- set allowed = {
+        'append': ['DUP_KEYS'],
+        'merge': ['PRIMARY_KEYS', 'UNIQUE_KEYS'],
     }.get(strategy) -%}
-    {%- if required is none -%}
+    {%- if allowed is none -%}
         {%- do return(none) -%}
     {%- endif -%}
 
     {%- set actual = starrocks__get_table_model(relation) -%}
-    {%- if actual is not none and actual != required -%}
+    {%- if actual is not none and actual not in allowed -%}
         {%- set msg -%}
             The '{{ strategy }}' incremental strategy requires {{ relation }} to be a
-            {{ required }} table, but it is a {{ actual }} table. If the model's config changed
-            since the table was built, rebuild it with `dbt run --full-refresh`.
+            {{ allowed | join(' or ') }} table, but it is a {{ actual }} table. If the model's config
+            changed since the table was built, rebuild it with `dbt run --full-refresh`.
         {%- endset -%}
         {%- do exceptions.raise_compiler_error(msg) -%}
     {%- endif -%}

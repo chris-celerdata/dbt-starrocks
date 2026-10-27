@@ -14,10 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `table_type` config is now case-insensitive (`'duplicate'`, `'primary'`, `'unique'` are all accepted)
 - `append` and `merge` incremental strategies. `append` is the explicit name for a plain
   `INSERT INTO` into a DUPLICATE KEY table. `merge` upserts into a PRIMARY KEY table, built
-  from `unique_key` or from `table_type='PRIMARY'` with `keys`. Neither is supported in a
-  configuration where the name would be misleading: `append` fails on a PRIMARY or UNIQUE
-  KEY table, where the insert would upsert, and `merge` fails on any other table type and in
-  external catalogs.
+  from `unique_key`, from `table_type='PRIMARY'` with `keys`, or from a contract
+  `primary_key` constraint; an existing UNIQUE KEY table is accepted too. Neither is
+  supported in a configuration where the name would be misleading: `append` fails on a
+  PRIMARY or UNIQUE KEY table, where the insert would upsert, and `merge` fails on any other
+  table type and in external catalogs. `merge` raises on `merge_update_columns`,
+  `merge_exclude_columns` and `incremental_predicates`, which need a `MERGE` statement.
 - `append` and `merge` check the existing table's key type on each incremental run, so a
   table built before its key config changed fails with a pointer to `--full-refresh`
   instead of silently appending or upserting.

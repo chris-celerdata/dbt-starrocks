@@ -132,8 +132,8 @@ models:
 {{ config(materialized='table', engine='OLAP', buckets=32, distributed_by=['id']) }}
 {{ config(materialized='table', indexs=[{ 'columns': 'idx_column' }]) }}
 {{ config(materialized='table', partition_by=['date_trunc("day", first_order)'], partition_type='Expr') }}
-{{ config(materialized='table', table_type='PRIMARY', keys=['customer_id'], order_by=['first_name', 'last_name'] }}
-{{ config(materialized='incremental', table_type='PRIMARY', engine='OLAP', buckets=32, distributed_by=['id']) }}
+{{ config(materialized='table', table_type='PRIMARY', keys=['customer_id'], order_by=['first_name', 'last_name']) }}
+{{ config(materialized='incremental', table_type='PRIMARY', keys=['id'], engine='OLAP', buckets=32, distributed_by=['id']) }}
 {{ config(materialized='incremental', incremental_strategy='merge', unique_key=['id']) }}
 {{ config(materialized='incremental', incremental_strategy='append') }}
 {{ config(materialized='incremental', partition_by=['my_partition_key'], partition_type='Expr', incremental_strategy='dynamic_overwrite') }}
@@ -201,7 +201,7 @@ The `incremental_strategy` config supports the following values:
 - `append`: Plain `INSERT INTO`. Rows are added; nothing is deduplicated or replaced.
   Requires a DUPLICATE KEY table, so `unique_key` cannot be set.
 - `merge`: Upsert on the table's PRIMARY KEY. Requires a PRIMARY KEY table: set `unique_key`,
-  or `table_type='PRIMARY'` with `keys`.
+  `table_type='PRIMARY'` with `keys`, or an enforced contract with a `primary_key` constraint.
 - `insert_overwrite`: Applies `overwrite` with `dynamic_overwrite = false` (StarRocks >= 3.4).
 - `dynamic_overwrite`: Applies `overwrite` with `dynamic_overwrite = true` (StarRocks >= 3.4).
 - `microbatch`: Processes the model in time-based batches; see the microbatch configs above.
@@ -218,15 +218,25 @@ builds the target as a [PRIMARY KEY table](https://docs.starrocks.io/docs/table_
 keyed on those columns, where an ordinary `INSERT INTO` *is* an upsert: matching keys are
 replaced, new keys are inserted.
 
-Three consequences worth knowing:
+How this differs from `merge` on other dbt adapters:
 
-- The whole row is always replaced, so `merge_update_columns` and `merge_exclude_columns`
-  are not supported and will raise an error rather than be silently ignored.
+- Rows are matched on the table's PRIMARY KEY, which is set when the table is created.
+  Changing `unique_key` (or `keys`) on an existing model does not change it: incremental runs
+  keep upserting on the old key, so rows that differ only in a newly added key column
+  overwrite each other. Rebuild the table with `dbt run --full-refresh`, or migrate its key
+  outside dbt, whenever the key changes.
+- If the new data contains several rows with the same key, one of them is kept and the rest
+  are dropped without an error, where a `MERGE` on Snowflake, BigQuery or Postgres fails.
+  Deduplicate in the model if that matters.
+- The columns the model produces are written. Columns the table has but the model no longer
+  produces (for example after `on_schema_change` changes) keep their existing values on
+  StarRocks >= 3.3.1, and are reset to their defaults on earlier versions. `merge_update_columns`, `merge_exclude_columns` and
+  `incremental_predicates` need a `MERGE` statement, which StarRocks does not have, so they
+  raise an error rather than being silently ignored.
 - On a partitioned table, StarRocks requires the partition column to be part of the primary
   key, so `unique_key` must include your `partition_by` column.
-- The PRIMARY KEY is set when the table is created, and incremental runs upsert on that key.
-  Changing `unique_key` (or `keys`) on an existing model has no effect until the table is
-  rebuilt with `dbt run --full-refresh`, or its key is migrated outside dbt.
+- An existing UNIQUE KEY table, which dbt cannot create but may have been created outside
+  it, is accepted too: an `INSERT` replaces its rows by key in the same way.
 
 `merge` is not supported for models in an external catalog, whose tables have no PRIMARY KEY.
 
@@ -239,7 +249,7 @@ for your table, which runs the same SQL:
 
 | Table built by the model | Use |
 |---|---|
-| PRIMARY KEY (`unique_key` set, or `table_type='PRIMARY'`) | `merge` |
+| PRIMARY KEY (`unique_key`, `table_type='PRIMARY'` with `keys`, or a contract `primary_key`) | `merge` |
 | DUPLICATE KEY (the default table type) | `append` |
 | External catalog | `append` |
 
