@@ -355,3 +355,80 @@ class TestExternalCatalogDeleteInsert:
         expected = ("does not support 'incremental_predicates'" if self._supports_iceberg_delete(project)
                     else "requires StarRocks 4.1 or later")
         assert expected in results[0].message
+
+
+delete_insert_composite_base_csv = """
+id,day,value
+1,1,10
+1,2,11
+2,1,20
+3,2,30
+""".lstrip()
+
+delete_insert_composite_update_csv = """
+id,day,value
+1,2,110
+2,1,200
+4,1,40
+""".lstrip()
+
+external_delete_insert_composite_sql = """
+{{
+    config(
+        materialized = 'incremental',
+        incremental_strategy = 'delete+insert',
+        catalog = 'iceberg_catalog',
+        database = 'dbt_test_delete_insert_composite',
+        unique_key = ['id', 'day'],
+    )
+}}
+select id, day, value from {{ ref(var('seed_name', 'composite_base')) }}
+""".lstrip()
+
+
+class TestExternalCatalogDeleteInsertCompositeKey:
+    """A multi-column unique_key deletes with `(id, day) IN (SELECT ...)`. A row matching on
+    `id` alone, here (1, 1), must survive. Guards the delete against StarRocks planning it as
+    a file-level metadata delete, which ignores the subquery (see SR-38368)."""
+
+    @pytest.fixture(scope="class")
+    def seeds(self):
+        return {
+            "composite_base.csv": delete_insert_composite_base_csv,
+            "composite_update.csv": delete_insert_composite_update_csv,
+        }
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {"external_delete_insert_composite.sql": external_delete_insert_composite_sql}
+
+    @pytest.fixture(scope="class", autouse=True)
+    def setup_external_catalog(self, project):
+        project.run_sql("""
+            CREATE DATABASE IF NOT EXISTS iceberg_catalog.dbt_test_delete_insert_composite
+            PROPERTIES ("location" = "s3://warehouse/dbt_test_delete_insert_composite")
+        """)
+        yield
+
+        # A failed run can leave its temp table behind, and an Iceberg database must be
+        # empty to drop.
+        for (table,) in project.run_sql(
+            "SHOW TABLES FROM iceberg_catalog.dbt_test_delete_insert_composite", fetch="all"
+        ):
+            project.run_sql(f"DROP TABLE iceberg_catalog.dbt_test_delete_insert_composite.{table} FORCE")
+        project.run_sql("DROP DATABASE IF EXISTS iceberg_catalog.dbt_test_delete_insert_composite")
+
+    def test_delete_insert_composite_key(self, project):
+        if not TestExternalCatalogDeleteInsert._supports_iceberg_delete(project):
+            pytest.skip("Iceberg DELETE needs StarRocks 4.1; the version gate is tested separately")
+
+        assert len(run_dbt(["seed"])) == 2
+        assert len(run_dbt(["run"])) == 1
+        assert len(run_dbt(["run", "--vars", "seed_name: composite_update"])) == 1
+
+        rows = project.run_sql(
+            "select id, day, value from iceberg_catalog.dbt_test_delete_insert_composite"
+            ".external_delete_insert_composite order by id, day",
+            fetch="all",
+        )
+        assert rows == [(1, 1, 10), (1, 2, 110), (2, 1, 200), (3, 2, 30), (4, 1, 40)]

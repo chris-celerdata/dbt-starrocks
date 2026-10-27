@@ -268,7 +268,8 @@ the table's key: `unique_key='event_date'` replaces every row of each date the n
 contains, including rows it no longer has.
 
 StarRocks cannot run the two statements in one transaction, so a query that reads the table
-between them sees the deleted rows missing.
+between them sees the deleted rows missing. If the `INSERT` fails after the `DELETE` has run,
+those rows stay missing until the model next runs successfully, which restores them.
 
 - **`default_catalog`:** the table must be a PRIMARY KEY table, the only table type StarRocks can
   delete from by subquery. Either set `unique_key` alone, which becomes the PRIMARY KEY (rows
