@@ -62,6 +62,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   models do. With no `database` config they used the profile's schema, so a custom schema
   (`+schema` or `generate_schema_name`) was ignored while dbt reported the resolved one, and
   anything that refs the model looked in the wrong schema (#132).
+- `view` models honour `config(catalog=...)` and `config(database=...)`. They used to be
+  created in `default_catalog` whatever the config said. An unchanged external view is
+  recognised and skipped, and a table at the view's name in an external catalog is dropped
+  in place, since renaming it is not supported everywhere (#127).
+- `ref()` to a model in an external catalog renders `catalog`.`database`.`name`. It used to
+  drop the catalog and the `database` config, so it resolved only when the session was
+  already in that catalog and the model had no `database` config. External models now carry
+  their catalog and database from parse time, so `this`, the relation cache and schema
+  creation all use them too. A project that overrides `generate_schema_name` has to apply
+  the `database` config itself for `ref()` to see it.
 - With `is_async: true`, a submitted task whose run briefly disappears from
   `information_schema.task_runs` (seen on 3.5 between `PENDING` and `RUNNING`) no longer
   counts as finished. The poller retries a missing run and fails the model if it stays

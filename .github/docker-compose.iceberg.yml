@@ -22,7 +22,7 @@ services:
       start_period: 30s
 
   rest:
-    image: tabulario/iceberg-rest:1.6.0
+    image: apache/iceberg-rest-fixture:1.10.1
     container_name: iceberg-rest
     networks:
       iceberg_net:
@@ -38,6 +38,8 @@ services:
       - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
       - CATALOG_S3_ENDPOINT=http://s3:9000
       - CATALOG_S3_PATH__STYLE__ACCESS=true
+      # The fixture's JDBC catalog serves Iceberg views only with the V1 schema.
+      - CATALOG_JDBC_SCHEMA__VERSION=V1
 
   s3:
     image: chrislusf/seaweedfs:4.47

@@ -16,38 +16,11 @@
 
 {% materialization table, adapter='starrocks' %}
   
-  {%- set target_relation = this.incorporate(type='table') -%}
-  
-  {%- set properties = config.get('properties', {}) -%}
-  {%- set catalog = config.get('catalog', target.catalog) -%}
-  {%- set database = config.get('database') or target_relation.schema -%}
+  {%- set target_relation = starrocks__model_relation('table') -%}
+  {%- set is_external = starrocks__external_catalog(target_relation.database) is not none -%}
+  {%- set existing_relation = starrocks__load_model_relation(target_relation) -%}
   {%- set on_table_exists = config.get('on_table_exists', 'replace') -%}
-  
-  {%- if catalog == 'default_catalog' -%}
-    {%- set is_external = false -%}
-  {%- else -%}
-    {%- if not catalog or not database -%}
-      {%- set msg -%}
-        External tables require both 'catalog' and 'database'
-      {%- endset %}
-      {{ exceptions.raise_compiler_error(msg) }}
-    {%- endif -%}
-    {%- set is_external = true -%}
-  {%- endif -%}
-  
-  {%- if is_external -%}
-    {%- set target_relation = adapter.Relation.create(
-        database=catalog,
-        schema=database,
-        identifier=target_relation.identifier,
-        type='table'
-    ) -%}
-    {%- set existing_relation = load_relation(target_relation) -%}
-    
-  {%- else -%}
-    {%- set existing_relation = load_cached_relation(this) -%}
-  {%- endif -%}
-  
+
   {%- if on_table_exists == 'swap' and is_external -%}
     {%- set msg -%}
       on_table_exists='swap' is only supported for tables in default_catalog: external catalogs have no ALTER TABLE ... SWAP WITH

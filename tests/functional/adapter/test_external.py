@@ -4,6 +4,7 @@ from dbt.tests.util import (
     check_relation_types,
     relation_from_name,
     run_dbt,
+    run_dbt_and_capture,
 )
 
 seed_base_csv = """
@@ -257,3 +258,139 @@ class TestExternalCatalogIncrementalCustomSchema:
             "incremental_custom_schema"
         ]
         assert self._tables(project, project.test_schema) == []
+
+
+external_catalog_view_sql = """
+{{
+    config(
+        materialized = 'view',
+        catalog = 'iceberg_catalog',
+        database = 'dbt_test_db',
+    )
+}}
+select 1 as id
+""".lstrip()
+
+
+class TestExternalCatalogView:
+    """A view configured with an external catalog must be created there.
+
+    The view materialization used to ignore `catalog` and silently build in
+    default_catalog (#127).
+    """
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "external_view.sql": external_catalog_view_sql,
+        }
+
+    @pytest.fixture(scope="class", autouse=True)
+    def setup_external_catalog(self, project):
+        project.run_sql("""
+            CREATE DATABASE IF NOT EXISTS iceberg_catalog.dbt_test_db
+            PROPERTIES ("location" = "s3://warehouse/dbt_test_db")
+        """)
+        yield
+
+        project.run_sql("DROP VIEW IF EXISTS iceberg_catalog.dbt_test_db.external_view")
+        project.run_sql("DROP DATABASE IF EXISTS iceberg_catalog.dbt_test_db FORCE")
+
+    def test_external_catalog_view(self, project):
+        results = run_dbt()
+        assert len(results) == 1
+
+        result = project.run_sql(
+            "select id from iceberg_catalog.dbt_test_db.external_view",
+            fetch="one",
+        )
+        assert result[0] == 1
+
+        internal = project.run_sql(
+            "select count(*) from information_schema.views"
+            f" where table_schema = '{project.test_schema}'"
+            " and table_name = 'external_view'",
+            fetch="one",
+        )
+        assert internal[0] == 0
+
+        # A second run finds the existing view and, since it is unchanged, skips it.
+        _, logs = run_dbt_and_capture(["--debug", "run"])
+        assert "skip `iceberg_catalog`.`dbt_test_db`.`external_view`" in logs
+
+
+external_ref_table_sql = """
+{{ config(materialized='table', catalog='iceberg_catalog', database='dbt_ref_db') }}
+select 1 as id
+""".lstrip()
+
+external_ref_default_db_sql = """
+{{ config(materialized='table', catalog='iceberg_catalog') }}
+select 2 as id
+""".lstrip()
+
+internal_from_external_sql = """
+{{ config(materialized='table') }}
+select id from {{ ref('ext_table') }}
+union all
+select id from {{ ref('ext_default_db') }}
+""".lstrip()
+
+external_view_from_external_sql = """
+{{ config(materialized='view', catalog='iceberg_catalog', database='dbt_ref_db') }}
+select id from {{ ref('ext_table') }}
+""".lstrip()
+
+
+class TestExternalCatalogRef:
+    """ref() to a model in an external catalog resolves to where it was built.
+
+    ref() used to render `<target schema>`.`<name>`, dropping both the catalog
+    and the `database` config, so it only resolved when the session was already
+    in that catalog and no `database` was set.
+    """
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "ext_table.sql": external_ref_table_sql,
+            "ext_default_db.sql": external_ref_default_db_sql,
+            "internal_from_ext.sql": internal_from_external_sql,
+            "ext_view_from_ext.sql": external_view_from_external_sql,
+        }
+
+    @pytest.fixture(scope="class", autouse=True)
+    def setup_external_catalog(self, project):
+        # dbt_ref_db is created up front. The target schema in the external
+        # catalog is left for dbt to create, as it does for any model's schema.
+        project.run_sql("""
+            CREATE DATABASE IF NOT EXISTS iceberg_catalog.dbt_ref_db
+            PROPERTIES ("location" = "s3://warehouse/dbt_ref_db")
+        """)
+        yield
+
+        project.run_sql("DROP VIEW IF EXISTS iceberg_catalog.dbt_ref_db.ext_view_from_ext")
+        project.run_sql("DROP TABLE IF EXISTS iceberg_catalog.dbt_ref_db.ext_table FORCE")
+        project.run_sql(
+            f"DROP TABLE IF EXISTS iceberg_catalog.{project.test_schema}.ext_default_db FORCE"
+        )
+        project.run_sql("DROP DATABASE IF EXISTS iceberg_catalog.dbt_ref_db FORCE")
+        project.run_sql(f"DROP DATABASE IF EXISTS iceberg_catalog.{project.test_schema} FORCE")
+
+    def test_ref_to_external_model(self, project):
+        results = run_dbt(["run"])
+        assert len(results) == 4
+
+        rows = project.run_sql(
+            f"select id from {project.test_schema}.internal_from_ext order by id",
+            fetch="all",
+        )
+        assert [row[0] for row in rows] == [1, 2]
+
+        rows = project.run_sql(
+            "select id from iceberg_catalog.dbt_ref_db.ext_view_from_ext", fetch="all"
+        )
+        assert [row[0] for row in rows] == [1]
+
+        # A second run takes the existing-relation paths against what the first built.
+        assert len(run_dbt(["run"])) == 4

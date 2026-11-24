@@ -76,38 +76,11 @@
 {%- materialization incremental, adapter='starrocks' -%}
     {%- set unique_key = starrocks__get_incremental_unique_key(config) -%}
     {%- set full_refresh_mode = (should_full_refresh()) -%}
-    {%- set identifier = this.name -%}
-    {%- set target_relation = api.Relation.create(
-        identifier=identifier,
-        schema=schema,
-        database=database,
-        type='table',
-    ) -%}
-    {%- set tmp_relation = make_temp_relation(this).incorporate(type='table') -%}
+    {%- set target_relation = starrocks__model_relation('table') -%}
+    {%- set is_external = starrocks__external_catalog(target_relation.database) is not none -%}
+    {%- set tmp_relation = make_temp_relation(target_relation).incorporate(type='table') -%}
 
-    {%- set catalog = config.get('catalog', target.catalog) -%}
-    {%- set database = config.get('database') or target_relation.schema -%}
-
-    {%- if catalog != 'default_catalog' and database -%}
-      {%- set is_external = true -%}
-    {%- endif -%}
-
-    {%- if is_external -%}
-      {%- set target_relation = adapter.Relation.create(
-        database=catalog,
-        schema=database,
-        identifier=target_relation.identifier,
-        type='table'
-      ) -%}
-      {%- set tmp_relation = adapter.Relation.create(
-        database=catalog,
-        schema=database,
-        identifier=tmp_relation.identifier,
-        type='table'
-      ) -%}
-    {%- endif -%}
-
-    {%- set existing_relation = load_relation(target_relation) -%}
+    {%- set existing_relation = starrocks__load_model_relation(target_relation) -%}
     {%- set incremental_strategy = starrocks__validate_get_incremental_strategy(config, is_external) -%}
 
     {{ drop_relation_if_exists(tmp_relation) }}

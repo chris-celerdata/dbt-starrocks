@@ -120,9 +120,17 @@
     {%- do return(rows[0][0] if rows | length > 0 else none) -%}
 {%- endmacro %}
 
+{#-- `database` is the catalog, which dbt passes already quoted. An unqualified information_schema
+     resolves in the session's current catalog, so an external catalog is listed with
+     SHOW DATABASES FROM instead. --#}
 {% macro starrocks__list_schemas(database) -%}
+    {%- set catalog = starrocks__external_catalog(database | replace('`', '') if database else none) -%}
     {% call statement('list_schemas', fetch_result=True, auto_begin=False) -%}
+      {%- if catalog is not none %}
+      show databases from `{{ catalog }}`
+      {%- else %}
       select distinct schema_name from information_schema.schemata
+      {%- endif %}
     {%- endcall %}
     {{ return(load_result('list_schemas').table) }}
 {%- endmacro %}

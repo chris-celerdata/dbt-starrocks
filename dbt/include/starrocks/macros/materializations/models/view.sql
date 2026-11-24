@@ -50,8 +50,10 @@
 
 {# Return the reconstructed DDL of a view in an external catalog (Iceberg,
    etc.), or none if it is absent. Uses `SHOW CREATE VIEW`, which routes
-   through the connector layer and is catalog-aware. 
-   Drop the whole PROPERTIES block today because the view
+   through the connector layer and is catalog-aware.
+   The DDL names the view itself, so that name is dropped: otherwise the
+   candidate built under a temporary name could never match the existing view.
+   Drop the whole PROPERTIES block too (it carries a per-statement queryId) because the view
    materialization does not expose a user `properties` config (unlike
    `table`/`materialized_view`). #}
 {% macro starrocks__stored_view_definition_external(relation) -%}
@@ -64,11 +66,12 @@
   {%- endif -%}
   {# Column index 1 is the `Create View` column #}
   {%- set ddl = result[0][1] -%}
+  {%- set ddl = modules.re.sub('^\\s*CREATE VIEW\\s+`[^`]*`', 'CREATE VIEW', ddl) -%}
   {{ return(modules.re.sub('\\s*PROPERTIES\\s*\\([^)]*\\)', '', ddl)) }}
 {%- endmacro %}
 
 {% macro starrocks__stored_view_definition(relation) -%}
-  {%- if starrocks__is_internal_catalog() -%}
+  {%- if starrocks__external_catalog(relation.database) is none -%}
     {{ return(starrocks__stored_view_definition_internal(relation)) }}
   {%- else -%}
     {{ return(starrocks__stored_view_definition_external(relation)) }}
@@ -77,8 +80,9 @@
 
 {% materialization view, adapter='starrocks' %}
 
-  {%- set existing_relation = load_cached_relation(this) -%}
-  {%- set target_relation = this.incorporate(type='view') -%}
+  {%- set target_relation = starrocks__model_relation('view') -%}
+  {%- set is_external = starrocks__external_catalog(target_relation.database) is not none -%}
+  {%- set existing_relation = starrocks__load_model_relation(target_relation) -%}
   {%- set sql = model['compiled_code'] -%}
   {%- set on_view_exists = config.get('on_view_exists', none) -%}
   {%- set grant_config = config.get('grants') -%}
@@ -88,7 +92,11 @@
   {# A non-view squatting on the target name (e.g. a table) must be dropped so a
      view can take its place; there is nothing to compare against. #}
   {%- set wrong_type_backup = none -%}
-  {%- if existing_relation is not none and not existing_relation.is_view -%}
+  {%- if existing_relation is not none and not existing_relation.is_view and is_external -%}
+    {#-- Rename support varies across external catalogs, so drop it in place instead of moving it to a backup. --#}
+    {{ adapter.drop_relation(existing_relation) }}
+    {%- set existing_relation = none -%}
+  {%- elif existing_relation is not none and not existing_relation.is_view -%}
     {%- set wrong_type_backup = make_backup_relation(target_relation, existing_relation.type) -%}
     {{ drop_relation_if_exists(load_cached_relation(wrong_type_backup)) }}
     {{ adapter.rename_relation(existing_relation, wrong_type_backup) }}
@@ -115,7 +123,7 @@
       stored definition against the existing view.
     #}
     {%- set intermediate_relation = make_intermediate_relation(target_relation) -%}
-    {{ drop_relation_if_exists(load_cached_relation(intermediate_relation)) }}
+    {{ drop_relation_if_exists(starrocks__load_model_relation(intermediate_relation)) }}
 
     {%- call statement('main') -%}
       {{ starrocks__create_view_as(intermediate_relation, sql) }}

@@ -110,3 +110,14 @@ class TestNestedNamespaceRendering:
         assert relation.without_identifier().render() == (
             '`iceberg__main__dev`.`bronze.nz_stats.census`'
         )
+
+    def test_catalog_only_with_catalog(self):
+        # dbt renders the catalog alone this way before listing a catalog's schemas
+        relation = StarRocksRelation.create(
+            database='iceberg_catalog',
+            schema='analytics_db',
+            identifier='t',
+            type='table'
+        )
+
+        assert relation.include(schema=False, identifier=False).render() == '`iceberg_catalog`'

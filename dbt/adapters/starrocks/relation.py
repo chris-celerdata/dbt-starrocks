@@ -91,7 +91,14 @@ class StarRocksRelation(BaseRelation):
             # The catalog is known, so each part is a single name. Dots inside
             # the schema are part of the database name (nested Iceberg
             # namespaces such as `bronze.nz_stats.census`), not separators.
-            parts = (self.database, self.schema, self.identifier)
+            # The catalog is always kept, since it is what places the relation;
+            # schema and identifier follow the include policy, so dbt can render
+            # a catalog alone (e.g. `include(schema=False, identifier=False)`).
+            parts = [self.database]
+            if self.include_policy.schema:
+                parts.append(self.schema)
+            if self.include_policy.identifier:
+                parts.append(self.identifier)
             return ".".join(self._quote_name(p) for p in parts if p is not None)
         if self.include_policy.database and self.include_policy.schema:
             raise DbtRuntimeError(
